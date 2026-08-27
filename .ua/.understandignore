@@ -1,0 +1,40 @@
+# .understandignore — 分析范围限定：后端核心 + 前端
+# 保留目录：internal/ cmd/ config/ migrations/ cli/ client/ docreader/ mcp-server/ frontend/ miniprogram/
+# 其余顶层目录与无关根文件排除（gitignore 语法，/ 前缀锚定项目根目录）
+
+# --- 排除非目标顶层目录 ---
+/docs/
+/website-docs/
+/examples/
+/dataset/
+/scripts/
+/testdata/
+/tests/
+/helm/
+/docker/
+/deploy/
+/Formula/
+/skills/
+/third_party/
+/packages/
+/misc/
+/.github/
+
+# --- 排除无关根文件 ---
+/CHANGELOG.md
+/LICENSE
+/SECURITY.md
+/README_JA.md
+/README_KO.md
+/rerank_server_demo.py
+/test_agent_config.sh
+/docker-compose.yml
+/docker-compose.dev.yml
+/.env.example
+/.env.lite.example
+/.air.toml
+/.golangci.yml
+/.dockerignore
+/.gitattributes
+/go.sum
+/VERSION

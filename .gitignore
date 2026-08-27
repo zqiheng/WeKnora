@@ -60,3 +60,18 @@ miniprogram/project.private.config.json
 
 # Staging dir for the Docker sandbox self-check probe (removed after each run)
 .weknora-sandbox-check-*
+
+# Eric 自用：understand 分析配置 + 分析文档
+!.ua/
+!.eric/
+.ua/*
+!.ua/.understandignore
+!.ua/config.json
+.eric/*
+!.eric/*.md
+
+# docreader 子项目的 understand 配置
+docreader/.ua/*
+!docreader/.ua/.understandignore
+!docreader/.ua/config.json
+docreader/.ua/.trash-*/

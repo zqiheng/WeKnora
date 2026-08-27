@@ -1,0 +1,7 @@
+# .understandignore — 分析范围：docreader 文档解析服务核心
+# 保留：parser/ splitter/ models/ utils/ client/ scripts/ + main.py config.py auth.py
+# 排除：生成的 protobuf、测试、测试数据
+
+/proto/
+/tests/
+/testdata/
