@@ -27,31 +27,40 @@
 
 LLM Wiki 是一条**离线异步流水线**，把「一批文档」转换成「一批互联的 Wiki 页面」，再在检索侧消费这些页面。
 
-```text
-┌────────────────────────── 生成（离线异步，Map/Reduce） ──────────────────────────┐
-│                                                                                  │
-│  文档入库完成 → KnowledgePostProcess → EnqueueWikiIngest                          │
-│     → 写 Postgres task_pending_ops（持久化待办，非 Redis list）                    │
-│     → 去抖 asynq 触发 → ProcessWikiIngest（一批最多 5 篇文档）                     │
-│          │                                                                       │
-│          ├─ Map 阶段（每篇文档，并行）                                             │
-│          │     Pass 0: 抽候选 slug（轻量骨架：name/slug/aliases/描述）             │
-│          │     Pass 1..N: chunk 引用（哪些 chunk 实质讨论了该候选）                 │
-│          │     └ 并行：生成 summary 页                                             │
-│          │                                                                       │
-│          ├─ Taxonomy 规划（整批一次 LLM 分配目录路径）                              │
-│          │                                                                       │
-│          └─ Reduce 阶段（每个 slug，并行 + per-slug 锁）                           │
-│                编译器式 LLM：合并新增引用 / 撤回失效内容（逐字接地）                  │
-│                                                                                  │
-│     → Finalize（去抖 KB 全局收敛）：重建 index 页 + 清死链 + 注入交叉链接 + 剪空目录  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph 生成["① 生成 · 离线异步 Map/Reduce"]
+        direction TB
+        A["文档入库完成"] --> B["KnowledgePostProcess"]
+        B --> C["EnqueueWikiIngest<br/>写 Postgres task_pending_ops（持久化待办）"]
+        C --> D["asynq 去抖触发"]
+        D --> E["ProcessWikiIngest · 一批 ≤5 篇文档"]
 
-┌────────────────────────── 使用（在线检索） ──────────────────────────────────────┐
-│  对话 query                                                                      │
-│    ├─ 混合检索：wiki 页面作为 ChunkTypeWikiPage chunk 参与召回 → 重排后 ×1.3 加权   │
-│    └─ Agent 工具：wiki_search / wiki_read_page / wiki_write_page / ...（精准读写） │
-└──────────────────────────────────────────────────────────────────────────────────┘
+        subgraph Map["Map 阶段 · 每篇文档并行"]
+            E --> F1["Pass 0 · 抽候选 slug<br/>轻量骨架 name/slug/aliases/描述"]
+            F1 --> F2["Pass 1..N · chunk 引用"]
+            F1 --> F3["并行 · 生成 summary 页"]
+        end
+
+        F2 --> G["Taxonomy 规划<br/>整批一次 LLM 分配目录"]
+        F3 --> G
+
+        subgraph Reduce["Reduce 阶段 · 每 slug 并行 + per-slug 锁"]
+            G --> H["编译器式 LLM<br/>合并新增 / 撤回失效（逐字接地）"]
+        end
+
+        H --> I["Finalize · 去抖 KB 收敛<br/>重建 index + 清死链 + 注入交叉链接 + 剪空目录"]
+    end
+
+    subgraph 使用["② 使用 · 在线检索"]
+        direction TB
+        J["对话 query"] --> K["混合检索 · wiki 页作 chunk 召回"]
+        K --> K1["重排 ×1.3 加权"]
+        J --> L["Agent 工具 · 精准读写<br/>wiki_search / wiki_read_page / wiki_write_page …"]
+    end
+
+    I -.->|"产出互联 wiki 页面"| K
+    I -.->|"产出互联 wiki 页面"| L
 ```
 
 一句话：**用 LLM 把「原始 chunk」蒸馏成「成体系的 wiki 页面」，让知识从「碎片」升级成「有结构、可导航、可被 LLM 直接读的二次文档」。**
@@ -172,6 +181,57 @@ type WikiConfig struct {
 ## 5. 生成管线：chunk-cited Map/Reduce
 
 管线主体在 `wiki_ingest_batch.go`（`ProcessWikiIngest`）+ `wiki_ingest_cite.go` + `wiki_ingest_taxonomy.go` + `wiki_ingest_dedup.go`。
+
+**核心流程图（端到端，mermaid）**：
+
+```mermaid
+flowchart TD
+    subgraph 触发["① 触发与入队"]
+        A["文档入库完成"] --> B["KnowledgePostProcess<br/>SetFinalizing 占位"]
+        B --> C["EnqueueWikiIngest<br/>写 Postgres task_pending_ops"]
+        C --> D["asynq 去抖触发<br/>ProcessIn 30s"]
+    end
+
+    subgraph 生成["② 生成管线 · chunk-cited Map/Reduce"]
+        D --> E["ProcessWikiIngest<br/>一批 ≤5 篇文档"]
+        E --> F["claimPendingList<br/>不相交认领待办行"]
+
+        subgraph Map["Map 阶段 · 每篇文档并行"]
+            F --> G["reconstructEnrichedContent<br/>文本 chunk + 图片 OCR/caption"]
+            G --> G1{"hasSufficientTextContent?<br/>有实质文本"}
+            G1 -- "否" --> SKIP["跳过 LLM 抽取"]
+            G1 -- "是" --> H["Pass 0 · 抽候选骨架<br/>extractCandidateSlugs"]
+            H --> H1{"Pass 0 成功?"}
+            H1 -- "否" --> H2["回退旧式<br/>extractEntitiesAndConceptsNoUpsert"]
+            H1 -- "是" --> PAR["并行两条 goroutine"]
+            H2 --> PAR
+            PAR --> I1["build summary<br/>WikiSummaryPrompt"]
+            PAR --> I2["classifyChunkCitations<br/>Pass 1..N 引用 chunk"]
+            I1 --> J["mergeCitationsIntoItems<br/>合并引用 + 新旧 slug 对账"]
+            I2 --> J
+            J --> K["产出 SlugUpdate 列表"]
+        end
+
+        K --> L["Taxonomy 规划<br/>planBatchTaxonomy 整批一次 LLM"]
+        L --> M["resolvePlannedFolders<br/>顺序建目录"]
+
+        subgraph Reduce["Reduce 阶段 · 每 slug 并行 + per-slug 锁"]
+            M --> N["reduceSlugUpdates<br/>编译器式合并"]
+            N --> O["逐字接地上下文<br/>new / deleted / remaining 源文档"]
+            O --> P["CreatePage / UpdatePage<br/>写 wiki_pages + 修订快照"]
+        end
+
+        P --> Q["死链清理 · publish 草稿页"]
+        Q --> R["enqueueFinalize<br/>去抖 20s"]
+        R --> S["ProcessWikiFinalize<br/>整 KB 一次收敛"]
+        S --> S1["重建 index intro · 注入交叉链接<br/>清死链 · 剪空目录链"]
+    end
+
+    subgraph 使用["③ 使用 · 在线检索"]
+        S1 --> U["Agent 工具<br/>wiki_search / wiki_read_page 直查"]
+        S1 --> V["wiki 页作 chunk 混合检索<br/>重排 ×1.3 加权"]
+    end
+```
 
 ### 5.0 整体流程（`ProcessWikiIngest`）
 
