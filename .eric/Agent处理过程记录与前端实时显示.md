@@ -186,6 +186,30 @@ trace → agent.execute (engine.go:238)
 
 敏感参数（如 `database_query` 的 SQL）在 `buildToolSpanInput`（`act.go:69`）被 redact。Langfuse 禁用时整个是 no-op（nil receiver 容忍），不影响主流程。
 
+### 汇总：每一类过程数据最终存哪
+
+一句话结论：**「过程数据」（思考 / 工具调用 / 结果）真正持久化的地方只有一个——数据库 `messages` 表**，其余是临时缓存或外部服务。
+
+| 数据 | 存储位置 | 生命周期 | 依据 |
+| --- | --- | --- | --- |
+| 思考 / 工具调用 / 工具结果（`AgentStep[].Thought`、`.ReasoningContent`、`.ToolCalls[].Args/Result/Duration`） | 数据库 `messages.agent_steps`（JSONB） | 永久 | `versioned/000000_init.up.sql:167`、`types/message.go:270` |
+| token 用量（`TurnUsage`） | 数据库 `messages.usage`（JSONB） | 永久 | `versioned/000085_message_usage.up.sql:1`、`types/message.go:291` |
+| 总耗时 | 数据库 `messages.agent_duration_ms`（BIGINT） | 永久 | `versioned/000019_add_agent_duration_ms.up.sql:3` |
+| 引用来源 | 数据库 `messages.knowledge_references`（JSONB） | 永久 | `versioned/000000_init.up.sql:166` |
+| 最终答案文本 | 数据库 `messages.content` | 永久 | `versioned/000000_init.up.sql:165` |
+| `AgentState`（内存真相源） | 进程内存，不落库 | 一次 `Execute` 结束即释放 | `types/agent.go:282` |
+| SSE 事件流 | `StreamManager`：默认内存 / 可选 Redis（TTL 1 小时） | 临时缓存 | `stream/factory.go:18` |
+| Langfuse 追踪 span | 外部服务 Langfuse / LiteFuse（OTLP 推送） | 外部 | `tracing/langfuse/manager.go:33` |
+| 结构化日志 | 日志文件 / stdout | 文件 | `common/tools.go:254` |
+
+三个关键点：
+
+1. **SSE 事件流是临时中转，不是存储。** 它只是「生成 → 推送」之间的缓冲，默认放**内存**（`MemoryStreamManager`），配了 `STREAM_MANAGER_TYPE=redis` 才放 Redis，且带 1 小时 TTL（`stream/factory.go:25`）。消息完成后即失效，因此历史回放不靠它，而是靠 `messages.agent_steps` 列（前端 `reconstructEventStreamFromSteps` 重建）。
+2. **内存 `AgentState` 是「生成期」的真相源**，生命周期只有一次请求；请求结束前被拷贝进 `Message.AgentSteps` 落库后即作废。
+3. **Langfuse 是可选外部可观测性**，数据不在本地库，禁用则完全不写。
+
+> 一句话总结：**实时看的靠内存/Redis 事件流；事后看（历史回放、多轮上下文）靠数据库 `messages` 表的那几列 JSONB。**
+
 ---
 
 ## 4. 前端：实时显示
