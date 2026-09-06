@@ -15,7 +15,7 @@
 3. [数据模型：WikiPage / WikiFolder / 修订](#3-数据模型wikipage--wikifolder--修订)
 4. [触发与入队：Postgres 持久化队列 + asynq 去抖](#4-触发与入队postgres-持久化队列--asynq-去抖)
 5. [生成管线：chunk-cited Map/Reduce](#5-生成管线chunk-cited-mapreduce)
-6. [八个关键设计原则（可移植的核心）](#6-八个关键设计原则可移植的核心)
+6. [九个关键设计原则（可移植的核心）](#6-九个关键设计原则可移植的核心)
 7. [检索与使用：重排加权 + Agent 工具](#7-检索与使用重排加权--agent-工具)
 8. [并发与可靠性设计](#8-并发与可靠性设计)
 9. [移植到自研知识库的落地建议](#9-移植到自研知识库的落地建议)
@@ -145,6 +145,72 @@ type WikiConfig struct {
 ```
 
 `ExtractionGranularity`（`focused/standard/exhaustive`）直接注入 Pass 0 的 prompt，控制候选抽取的**激进程度**——这是「抽取粒度」的单一旋钮。
+
+### 3.5 落库形态：正文是 Markdown，存四张关系表
+
+**格式**：一个页面落库后，`content` 就是一段**纯 Markdown 字符串**（不是 JSON/HTML/结构化对象），存在 `wiki_pages.content`（Postgres `TEXT` / SQLite `TEXT`）里。页面间用 `[[slug|显示名]]` 互链，正文里的链接是唯一真相源（§6.6）。
+
+**存储位置**：正文存在**关系型数据库**（生产 Postgres，Lite 模式 SQLite，GORM 双方言），不是文件系统、不是对象存储、也不进向量库。共四张表：
+
+| 表 | 结构体 | 用途 | migration |
+| --- | --- | --- | --- |
+| `wiki_pages` | `WikiPage` | 页面主表，`content` 列存 Markdown 正文 | `000037_wiki_and_indexing` |
+| `wiki_folders` | `WikiFolder` | 目录树（邻接表 `ParentID`） | `000061_wiki_page_hierarchy` |
+| `wiki_page_revisions` | `WikiPageRevision` | 版本历史快照（不可变） | `000075_wiki_page_revisions` |
+| `wiki_page_issues` | `WikiPageIssue` | 页面问题 / 质量检查 | `000037_wiki_and_indexing` |
+
+（配置不在这四张表里，而在 `knowledge_bases.wiki_config` 这个 JSONB 列，只承载「是否启用 / 抽取粒度 / 并发参数」，不是内容。）
+
+**一条真实形态的落库记录**（字段名/类型来自 `WikiPage` 的 `json` tag；正文按 `testdata/wiki_test/doc2_psionic_engine.md` 的约定重构——仓库里没有硬编码的成品，`content` 是运行时由 LLM 生成的）：
+
+```json
+{
+  "id": "8f3c2a1e-9b7d-4c6a-8e2f-1a0b3c5d7e9f",
+  "tenant_id": 1,
+  "knowledge_base_id": "kb-a1b2c3d4-0000-1111-2222-333344445555",
+  "slug": "entity/psionic-engine",
+  "title": "幽能引擎 (Psionic Engine)",
+  "page_type": "entity",
+  "status": "published",
+  "content": "# 幽能引擎 (Psionic Engine)\n\n幽能引擎是[[entity/stardust-project|星尘计划]]计划开发的一种革命性推进系统……",
+  "summary": "星尘计划开发的一种革命性推进系统，基于虚空共振理论。",
+  "aliases": ["幽能引擎", "Psionic Engine", "psionic"],
+  "folder_id": "fld-1a2b3c4d-5e6f-7890-abcd-ef1234567890",
+  "category_path": ["星尘计划"],
+  "wiki_path": "entity/星尘计划/幽能引擎 (Psionic Engine)",
+  "depth": 1,
+  "sort_order": 0,
+  "source_refs": [
+    "k-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee|幽能引擎技术白皮书",
+    "k-11111111-2222-3333-4444-555555555555|星尘计划启动备忘录"
+  ],
+  "chunk_refs": [
+    "ch-00000000-0000-0000-0000-000000000001",
+    "ch-00000000-0000-0000-0000-000000000002"
+  ],
+  "in_links": ["entity/stardust-project", "concept/void-resonance-theory"],
+  "out_links": [
+    "entity/stardust-project",
+    "concept/void-resonance-theory",
+    "entity/starquartz",
+    "entity/skyvault-consortium"
+  ],
+  "page_metadata": {},
+  "version": 3,
+  "last_edit_source": "pipeline",
+  "created_at": "2026-09-05T10:00:00Z",
+  "updated_at": "2026-09-05T10:30:00Z",
+  "deleted_at": null
+}
+```
+
+几个要点：
+
+- **`content` 是正文，`summary` 是一句话摘要**；`chunk_refs` 是「出处」——每条正文的证据 chunk UUID，引用不写进正文脚注，而是落这个结构化字段，删源文档时可据此精确撤回（§6.2）。
+- **`out_links` 是派生冗余**：永远等于 `parseOutLinks(content)`（每次写库重解析），`in_links` 由它反向维护；存一份是为了列表/索引不必每次重解析全文（§6.6）。
+- **`wiki_path` / `category_path` / `depth` 是缓存投影**：由 `folder_id` 的目录链反算，`wiki_path = page_type/category_path.../title`（`buildWikiPath`，`wiki_page.go`），只为排序便宜。
+- **带 `omitempty` 的字段**（`parent_slug`/`folder_id`/`category_path`/`wiki_path`/`depth`/`sort_order`/`last_edit_source`/`last_editor_id`）空值时不进 JSON；`page_metadata` 无 `omitempty`，空时为 `{}`。
+- **不存哪里**：正文**不落向量库/ES**——Wiki 检索走 §7.2 的工具直查 Postgres（tsvector/trigram/regex 全文），「作为 chunk 进混合检索」的创建侧未接线（§7.3）；图片只存 URL（正文 `![](url)`），图片二进制不进 wiki 表。
 
 ---
 
@@ -421,7 +487,7 @@ prompt 里塞了**十几条正反例**（正确合并：`Acme Corp → Acme Corp
 
 ---
 
-## 6. 八个关键设计原则（可移植的核心）
+## 6. 九个关键设计原则（可移植的核心）
 
 这一节是给你「搬到自己的知识库」准备的——剥掉 WeKnora 的 Go/asynq/Postgres 细节，剩下的这些**设计原则**才是真正值钱的部分。
 
@@ -474,6 +540,22 @@ Reduce 的 prompt（`WikiPageModifySystemPrompt`）明确要求模型扮演**编
 
 - **图片 URL 掩码**：正文里的图片 URL 在进/出 LLM 时替换成不透明 token，防止模型复写 URL 出错、也防把对象存储 URL 泄露进 prompt；
 - **行内 chunk 引用剥离**（`stripWikiInlineChunkCitations`）：citation 阶段产生的 `[c003]` 短句柄只对机器有意义，写库前用正则 `[ \t]*\[c\d{3,}([;,]\s*c\d{3,})*\]` 从正文和摘要里剥掉，**不泄露到读者可见的 Markdown**。
+
+### 6.9 人工编辑 vs 机器生成的冲突：软合并 + 硬归置 + 快照兜底
+
+人工编辑与后续 ingest 的冲突**没有「用户编辑只读」的硬锁**——ingest 管线（`wiki_ingest*.go`）从不读 `LastEditSource`。系统靠三层防护兜住：
+
+1. **软合并（prompt 层，主体）**：Reduce 把当前页面（含人工编辑）作为 `<existing_page_content>` 原样喂回 `WikiPageModifyUserPrompt`，指令是「保留仍有效、仍相关的内容，只做增量」。冲突裁决规则（`WikiPageModifySystemPrompt`）：
+   - 新 chunk **明确且直接**推翻旧内容 → 更新正文 + 追加一段 `Contradictions / Updates` 说明变更；
+   - 冲突**模糊或未被 chunk 直接支撑** → **不覆盖**旧内容，只追加 `Contradictions / Updates` 段；
+   - 「同名不同物」的新信息 → `CRITICAL CONFLICT CHECK` 直接拒绝并入（§5.6 ④）。
+   注意：prompt 里**不区分哪段是人写的、哪段是机器写的**——人工编辑和机器内容在 LLM 眼里都是「existing content」，一视同仁地「保留仍有效部分」。
+
+2. **硬归置（Go 层，确定性）**：目录只对 `FolderID == ""` 的新页赋（`wiki_ingest_batch.go:2094`），人工移动过的页永不重归置（`manual edits are authoritative`）。
+
+3. **快照兜底**：覆盖前旧版本先整份快照进 `wiki_page_revisions`（`edit_source=user`）；软上限 50 版**只裁剪 `pipeline` 快照**（§3.3），人工版本不被挤掉；随时可 `POST /revert` 回滚。
+
+**残余风险**：由于 prompt 不区分作者，纯人工补充、且与任何源文档都无关的内容，在「源文档被删」触发撤回时理论上可能被 LLM 误判为「仅来自被删文档」而撤掉；新源明确推翻时机器会赢（这是设计意图）。二者都由快照 + revert 兜底，但「用户编辑神圣不可侵犯」的强语义目前不存在。
 
 ---
 
