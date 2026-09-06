@@ -177,6 +177,71 @@ LLM 返回 ToolCall {name, arguments}
 | 跟进 | FAQ 命中 → `list_knowledge_chunks(faq_id=cN)`；文档命中 → `list_knowledge_chunks(knowledge_id=dN)` 或 `get_document_info(knowledge_ids=[dN])` |
 | 文件 | `internal/agent/tools/grep_chunks.go` |
 
+#### 5.2.1 `grep_chunks` 实现详解
+
+`grep_chunks` 是「把正则直接下推到数据库 + 作用域鉴权 + 打分/MMR/去重 + 会话级 already_seen 压缩」的一条流水线。整个 `Execute`（`grep_chunks.go:86`）分五步：**解析参数 → 编译正则校验 → 作用域裁剪并查库 → 去重/打分/MMR/排序/截断 → 组装 XML 输出**。
+
+##### ① 正则下推到数据库（dialect 分派）
+
+匹配发生在 DB 层，不是把 chunk 拉回内存再扫。`regexOperatorForDialect`（`grep_chunks.go:243`）按 dialect 选算子：
+
+| 数据库 | 算子 | 大小写不敏感如何保证 |
+| --- | --- | --- |
+| PostgreSQL | `~*` | 算子本身 case-insensitive |
+| MySQL / SQLite | `REGEXP` | 依赖列默认 collation（`utf8mb4_general_ci`）或驱动 REGEXP 扩展 |
+
+核心 SQL（`searchChunks`，`grep_chunks.go:385-419`）是 `chunks` JOIN `knowledges`，对 `chunks.content` **和** `knowledges.title` 各套一次正则：
+
+```sql
+WHERE chunks.is_enabled = true
+  AND chunks.deleted_at IS NULL
+  AND knowledges.deleted_at IS NULL
+  AND <scopeClause: @KB / @tag / @file 三选一或多选 OR>
+  AND ( (chunks.content ~* ? OR knowledges.title ~* ?) OR (…) )
+ORDER BY chunks.created_at DESC
+LIMIT 500
+```
+
+**为什么同时匹配 `knowledges.title`**：一个文档标题就叫「图片素材」时，正文可能很少重复这个词，但标题命中恰恰是最贴题的——所以标题也参与匹配，且命中后额外 boost（见 ④）。
+
+##### ② 作用域裁剪（`resolveGrepScope` + `scopeClause`）
+
+只搜当前会话 `SearchTargets` 范围。`resolveGrepScope`（`grep_chunks.go:258`）把目标拆成三类，`scopeClause`（`grep_chunks.go:326`）拼成 OR 子句：
+
+- **full-KB**：`chunks.knowledge_base_id = ? AND chunks.tenant_id = ?`；
+- **指定文档**：`chunks.knowledge_id IN ?`（已带文档白名单的 target 走这里，避免落到 tag 分支把范围扩大）；
+- **tag 约束**：`EXISTS (SELECT 1 FROM knowledge_tag_relations ktr WHERE ktr.knowledge_id = chunks.knowledge_id AND ktr.tag_id IN ?)`——tag 不展开成巨大 `knowledge_id IN` 列表，而是直接走 `knowledge_tag_relations` 索引。
+
+三者 OR 拼接，所以一轮里 `@KB + @tag + @file` 混选会**同时搜所有作用域**（与 `knowledge_search` 的并发 fan-out 语义一致），而不是取交集或只保留一个。
+
+##### ③ 单参数 `query` + JSON 转义坑
+
+入参是**单个 `query` 字符串**（`GrepChunksInput`，`grep_chunks.go:54`），多个概念用 `|` 交替合并成一条正则。description 里专门警告一个高频翻车点（`grep_chunks.go:29`）：**JSON 里每个反斜杠必须写成 `\\`**——搜字面 `C++` 要写 `"C\\+\\+"` 而不是 `"C\+\+"`，搜 `\d+` 要写 `"\\d+"`，因为裸 `\+` / `\d` 是非法 JSON 转义，会解析失败。
+
+执行前先用 Go 的 `regexp.Compile("(?i)"+query)` 校验语法（`grep_chunks.go:114`）——这一步既做了 `(?i)` 大小写不敏感前缀，又能在发到 DB 之前拦住非法正则。旧的 `queries`/`patterns` 数组别名仍被接受，内部 join 成一条 `|` 正则，保持「match ANY」语义不变。
+
+##### ④ 结果管线：去重 → 打分 → MMR → 排序 → 截断
+
+1. **查库**：`searchChunks` 一次 `Find` 最多取 500 条原始命中，附带每个文档的 chunk 总数（`TotalChunkCount`，二次 `GROUP BY` 查询）。
+2. **去重**（`deduplicateChunks`，`grep_chunks.go:832`）：四重 key——`id`、`parent:<ParentChunkID>`、`kb:<knowledge_id>#<chunk_index>`、内容签名（`BuildContentSignature` 近重复），任一命中即跳过。
+3. **打分**（`scoreChunks`，`grep_chunks.go:889`）：`MatchScore = 命中模式数/总模式数 + 靠前位置加分（≤0.1）`；**标题命中**时 `TitleMatch=true` 且 `score += 0.5`（封顶 1.0），即使正文从未匹配也计 `MatchedPatterns=1`，保证标题贴题的文档不会被 MMR 淘汰。
+4. **MMR**（`applyMMR`，`grep_chunks.go:959`）：超过 10 条时对候选取 `k=min(len, limit)`、`λ=0.7` 的 Maximal Marginal Relevance，用 Jaccard 相似度去冗余，避免一堆内容雷同的 chunk 挤掉上下文。
+5. **排序 + 截断**：先按 `TitleMatch`（标题命中永远第一）→ `MatchedPatterns` 降序 → `MatchScore` 降序 → `ChunkIndex` 升序，最后截断到 `limit=30`（后端硬编码，不随正则广度变化，保护 LLM 上下文）。
+
+##### ⑤ 会话级 `already_seen` 去重（省 token）
+
+`GrepChunksTool` 实例**按会话一个**，内部持 `seenChunks map[string]bool`（带 `sync.Mutex`）。`formatOutput` 每次输出后把 chunk id 记进这个 map；同一 chunk 在本会话后续的 `grep_chunks` 调用里再次命中时，输出带 `already_seen="true"` 并**省略 `<match_snippet>`**，只留一行 `<note>snippet omitted…</note>`——避免 LLM 反复读同一段 snippet（与 `wiki_search` 同一 UX 思路）。
+
+##### ⑥ 输出：XML 结构 + 双份数据
+
+`Output` 字段是 `<grep_results>` XML（`formatOutput`，`grep_chunks.go:473`）：外层 `chunk_count`，每个命中 `<chunk chunk_id="cN" knowledge_id="dN" knowledge_title="..." chunk_index=".." score="0.xxx">`（FAQ 命中是 `<faq faq_id="cN">`，带 `faq_question` 属性），内含 `<query_hit>`（各模式命中次数）和 `<match_snippet>`（首个匹配的上下文片段，换行压缩成单行、长度受限）。XML 用最小转义 `xmlEscape`（`& < > " '`），因为消费方是 LLM 而非严格 XML 解析器。
+
+`Data` 字段同时给前端准备了两份结构（`grep_chunks.go:205-221`）：
+
+- `chunk_results`：per-chunk 命中（前端按 `knowledge_id` 分组展示详情）；
+- `knowledge_results`：per-document 预聚合（`aggregateByKnowledge`，按 `TitleMatch`/`DistinctPatterns`/`TotalPatternHits`/`ChunkHitCount` 排序，超 20 行截断）；
+- `document_count`：distinct 文档总数（即使 `knowledge_results` 被截断仍准确），`display_type="grep_results"`。
+
 ### 5.3 `list_knowledge_chunks` — 查看文档分块
 
 | 项 | 说明 |
@@ -211,6 +276,30 @@ LLM 返回 ToolCall {name, arguments}
 | 参数 | `sql`（SELECT 语句；**不要**自己写 tenant_id 条件） |
 | **适用范围** | 这是「当前 KB 有多少文档 / 涉及哪些文档 / 总结全库」这类**元数据聚合问题唯一精确的答案来源**（见 README 里的三类问题分析） |
 | 文件 | `internal/agent/tools/database_query.go` |
+
+#### 5.5.1 SQL 是怎么生成的：LLM 动态生成，而非提取预写模板
+
+`database_query` 的 SQL **不是从预写好的模板库里取出来套参数**，而是由 LLM 在每一轮里**根据用户问题动态拼写**。整条链路是「LLM 生成语义 → 后端只做校验与安全加固」，两者分工明确：
+
+```text
+用户自然语言问题
+   + 工具 description（三张白名单表的 schema 字段含义 + 4 个 SQL 示例）
+        ↓  LLM 推理（function calling）
+动态拼出 SELECT SQL（按问题里的条件加 WHERE / GROUP BY / JOIN / LIMIT）
+        ↓  以 { "sql": "..." } 参数调用 database_query 工具
+validateAndSecureSQL（后端硬编码安全边界，改写/校验 SQL）
+        ↓  t.db.Raw(securedSQL).Rows() 执行
+```
+
+三个关键点：
+
+1. **入参只有 `sql` 一个字段，没有模板索引**。工具入参结构体 `DatabaseQueryInput` 只含 `SQL string`（`database_query.go:95-97`），`Execute` 直接 `json.Unmarshal` 拿到 LLM 传来的字符串并执行（`database_query.go:125-165`）。后端自身**不产出 SQL**，只执行 LLM 给的 SQL。
+
+2. **description 里的表结构和示例是「few-shot 提示」，不是可复用的模板**。工具 description（`database_query.go:17-91`）写死了 `knowledge_bases` / `knowledges` / `chunks` 三张表的列定义，以及 4 个示例（查 KB 信息、按状态 COUNT、SUM 存储、JOIN 出文档数）。这些示例的作用是**教会 LLM 怎么组织 SQL**——用户问「各状态文档数」→ LLM 自己写 `GROUP BY parse_status`；问「哪个 KB 文档最多」→ 自己写 `LEFT JOIN ... COUNT`。示例本身不会被取值复用。
+
+3. **安全边界是后端硬编码强制的，不依赖 LLM 自觉**。`validateAndSecureSQL`（`database_query.go:252-279`）调 `utils.ValidateAndSecureSQL` 做动态改写与约束：自动注入 `tenant_id`、软删除过滤、只允许 `SELECT`、白名单表校验、隐藏 KB / chunk enabled 过滤、注入风险检查、会话作用域过滤。也就是说 SQL 的**语义是动态的**，但**能查谁、能查什么、能查到多少是后端写死的**。
+
+> 顺带：同目录的 `data_analysis.go`（DuckDB 表格数据分析）也是同一模式——SQL 由 LLM 对用户上传的 CSV/Excel 动态生成，只是它没有 tenant/白名单这类元数据约束，换成 DuckDB 侧的只读与沙箱限制。
 
 ### 5.6 `query_knowledge_graph` — 查询知识图谱
 
@@ -266,6 +355,68 @@ LLM 返回 ToolCall {name, arguments}
 
 文件：`web_search.go`、`web_fetch.go`。
 
+#### 7.1.1 `web_search` 实现详解
+
+`web_search` 的实现是「工具层（薄封装）→ 服务层（编排 + RAG 压缩）→ 基础设施层（多 provider 注册表）」三层结构：
+
+```text
+internal/agent/tools/web_search.go          工具层：function calling 入口 + 结果格式化
+        ↓ 调用 WebSearchService
+internal/application/service/web_search.go  服务层：解析 provider、RAG 压缩、黑名单过滤
+        ↓ 调用 WebSearchProvider
+internal/infrastructure/web_search/*.go     基础设施层：registry + 各 provider 实现
+```
+
+##### ① 工具层（`web_search.go`）
+
+- **注册门槛**：`WebSearchEnabled=true` 才在 `registerTools`（`agent_service.go:724`）注入；`maxResults` 在 `NewWebSearchTool` 里用 `fmt.Sprintf` 填进 description 的两个 `%d` 占位符（`web_search.go:99-100`）。
+- **KB-First 规则写死在 description 里**（`web_search.go:20-24`）：`ABSOLUTE RULE`——必须先跑完 `grep_chunks` + `knowledge_search`，二者都无结果才允许用 web_search。注意这是**靠 prompt 约束**，不是后端代码强制（后端无法知道 LLM 是否先检索过）。
+- **Execute 流程**（`web_search.go:115-292`）：解析 `query` → 取 `tenantID`（0 直接报错）→ 组装 `searchConfig`（`EffectiveWebSearchConfig` 归一化，`MaxResults` 用 agent 配置覆盖）→ `webSearchService.Search(...)` → 按需 RAG 压缩 → 格式化输出（Title/URL/Snippet/Content，Content 截断 500 字符）+ 末尾「Next Steps」引导。
+
+##### ② 服务层（`web_search.go`）
+
+`Search`（`web_search.go:48-83`）四步：`resolveProvider` 解析 provider 实例 → `context.WithTimeout`（默认 10s）→ `provider.Search(...)` → `filterBlacklist`（支持通配符 `*://*.example.com/*` 与正则 `/example\.(net|org)/`）。
+
+`resolveProvider` 两条路径：新路径 `providerID` 非空 → 从 DB 读 `WebSearchProviderEntity`（按 tenantID 隔离）→ `registry.CreateProvider` 实例化；旧路径 `providerID` 为空 → 用已废弃的 `config.Provider/APIKey` 字段向后兼容。
+
+**providerID 解析优先级**（`session_agent_qa.go:365-370`）：Agent 配置 `WebSearchProviderID` > tenant 默认 provider（`is_default=true`）。
+
+##### ③ 基础设施层（`infrastructure/web_search/`）
+
+`Registry`（`registry.go`）是「类型 ID → 工厂函数」的 map，按需实例化。支持的 provider（`GetWebSearchProviderTypes`，`web_search_provider.go:173`）：
+
+| provider | 免 key/需 key | 特点 |
+| --- | --- | --- |
+| `duckduckgo` | 免 key | HTML 抓取为主，Instant Answer API 兜底 |
+| `bing` / `google` / `tavily` / `exa` / `metaso` / `zhipu` / `baidu` | 需 key | 官方 API |
+| `ollama` / `keenable` | keenable 可选 key | AI 搜索 |
+| `searxng` | 免 key | 自托管，需 BaseURL（SSRF 白名单校验） |
+
+以 `duckduckgo.go` 为例：`Search` 先试 **HTML 抓取**（`html.duckduckgo.com/html/`，goquery 解析 `.web-result`，URL 经 `cleanDDGURL` 还原），失败再降级 **API**。
+
+**安全**：API key 用 AES-GCM 加密落库（`WebSearchProviderParameters.Value/Scan`）；`BaseURL`/`ProxyURL` 经 `ValidateURLForSSRF` 校验，私有主机需加 `SSRF_WHITELIST`。
+
+##### ④ RAG 压缩（`CompressWithRAG`）—— 核心增值点
+
+当 `CompressionMethod != "none"` 时，不直接返回搜索结果，而是**把结果灌进临时 KB，再对 query 做混合检索，只回最相关片段**（`web_search.go:190-211`）：
+
+```text
+web search 原始结果（每条 = title + snippet + body）
+  → 按 URL 去重（seenURLs）
+  → 拼成 "[sourceUrl] + title + snippet + body" 一段
+  → CreateKnowledgeFromPassageSync 同步写入临时 KB（IsTemporary=true，UI 不显示）
+  → 对 query 做 HybridSearch（VectorThreshold=0.2, KeywordThreshold=0.2, MatchCount=DocumentFragments 默认 3）
+  → selectReferencesRoundRobin（跨 URL 轮询公平取片段）+ consolidateReferencesByURL（按 URL 归并、去掉 [sourceUrl] 标记行）
+  → 每个 URL 的 Content = 检索命中的相关片段拼接（而非整页）
+```
+
+**临时 KB 状态存 Redis**（`webSearchStateService`，`web_search_state.go`）：以 sessionID 作 key 存 `{tempKBID, seenURLs, knowledgeIDs}`，跨轮复用同一临时 KB，避免重复建库/索引；会话结束 `DeleteWebSearchTempKBState` 清理。压缩失败（如未配 `embedding_model_id`）则 `Warnf` 后**降级用原始结果**，不阻塞回答。
+
+##### ⑤ 结果进入后续流程
+
+- `Data` 带 `display_type: "web_search_results"`，每个结果标 `evidence_type: "search_summary"`、`page_verified: false`——表示「搜索摘要，非已核验整页」，供前端与引用协议使用。
+- 结果里的 `wN` 短 ID 由 `modelcontext.Registry` 登记，后续 `web_fetch` 可抓 `wN` 对应整页做深度验证（`web_fetch.go` 也要求 `WebSearchEnabled` 才启用）。
+
 ### 7.2 记忆 / 历史类
 
 | 工具 | 作用 | 调用场景 | 适用范围 |
@@ -315,6 +466,10 @@ LLM 返回 ToolCall {name, arguments}
 | 各工具实现 | `internal/agent/tools/*.go` |
 | 作用域鉴权 | `internal/agent/tools/scope_authorization.go` |
 | SQL 鉴权注入（database_query） | `internal/utils/inject.go` |
+| 网页搜索（web_search / web_fetch 工具层） | `internal/agent/tools/web_search.go`、`web_fetch.go` |
+| 网页搜索服务编排 + RAG 压缩 | `internal/application/service/web_search.go`、`web_search_state.go` |
+| 网页搜索 provider（registry + 各实现） | `internal/infrastructure/web_search/*.go` |
+| 网页搜索 provider 配置实体 | `internal/types/web_search_provider.go` |
 | 参数校验/转换/JSON 修复 | `param_validate.go` / `param_cast.go` / `json_repair.go` |
 | 短 ID handle 机制 | `internal/modelcontext/`（`Registry`）、`internal/agent/tools/normalize_id.go` |
 | 人工审批 | `internal/agent/approval/gate.go` |
