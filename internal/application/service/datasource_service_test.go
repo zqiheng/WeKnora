@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func (s *processSyncKBService) ListKnowledgeBasesByTenantID(context.Context, uin
 }
 
 func (s *processSyncKBService) UpdateKnowledgeBase(
-	context.Context, string, string, string, *types.KnowledgeBaseConfig,
+	context.Context, string, string, string, *types.KnowledgeBaseConfig, *types.VLMConfig,
 ) (*types.KnowledgeBase, error) {
 	return nil, nil
 }
@@ -102,6 +103,17 @@ func (s *processSyncKBService) TogglePinKnowledgeBase(context.Context, string) (
 }
 
 func (s *processSyncKBService) HybridSearch(context.Context, string, types.SearchParams) ([]*types.SearchResult, error) {
+	return nil, nil
+}
+
+func (s *processSyncKBService) HybridSearchWithRerank(
+	ctx context.Context, id string, params types.SearchParams,
+) (*types.RetrievalResult, error) {
+	results, err := s.HybridSearch(ctx, id, params)
+	return &types.RetrievalResult{Results: results}, err
+}
+
+func (s *processSyncKBService) ReadChunkImage(context.Context, *types.SearchResult) ([]byte, error) {
 	return nil, nil
 }
 
@@ -254,9 +266,15 @@ func (r *processSyncTenantRepo) GetTenantByID(context.Context, uint64) (*types.T
 
 type processSyncTagService struct {
 	interfaces.KnowledgeTagService
+	ctx context.Context
 }
 
-func (*processSyncTagService) FindOrCreateTagByName(context.Context, string, string) (*types.KnowledgeTag, error) {
+func (s *processSyncTagService) FindOrCreateTagByName(
+	ctx context.Context,
+	_ string,
+	_ string,
+) (*types.KnowledgeTag, error) {
+	s.ctx = ctx
 	return nil, nil
 }
 
@@ -264,7 +282,7 @@ type deletionLookupKnowledgeRepo struct {
 	interfaces.KnowledgeRepository
 	knowledge         *types.Knowledge
 	lookupErr         error
-	metadataUpdates   []map[string]string // metadata persisted via UpdateKnowledge
+	metadataUpdates   []map[string]string // metadata persisted via UpdateKnowledge / UpdateKnowledgeColumn
 	metadataUpdateErr error
 	hardDeleted       []string
 	hardDeleteErr     error
@@ -286,6 +304,19 @@ func (r *deletionLookupKnowledgeRepo) UpdateKnowledge(_ context.Context, knowled
 	}
 	r.metadataUpdates = append(r.metadataUpdates, metadata)
 	return nil
+}
+
+func (r *deletionLookupKnowledgeRepo) UpdateKnowledgeColumn(
+	ctx context.Context, id string, column string, value interface{},
+) error {
+	if column != "metadata" {
+		return fmt.Errorf("unexpected column update %q", column)
+	}
+	raw, ok := value.(types.JSON)
+	if !ok {
+		return fmt.Errorf("unexpected metadata value %T", value)
+	}
+	return r.UpdateKnowledge(ctx, &types.Knowledge{ID: id, Metadata: raw})
 }
 
 func (r *deletionLookupKnowledgeRepo) FindByDataSourceExternalID(
@@ -499,6 +530,43 @@ func TestIngestItem_URLCreationAttachesDataSourceMetadata(t *testing.T) {
 	require.Len(t, repo.metadataUpdates, 1)
 	assert.Equal(t, ds.ID, repo.metadataUpdates[0]["datasource_id"])
 	assert.Equal(t, "url:1", repo.metadataUpdates[0]["external_id"])
+}
+
+// TestIngestItem_PersistsSourceUpdatedAt verifies that the connector-supplied
+// last-modified time reaches the persisted metadata as an RFC3339 UTC string,
+// and that an item without one gets no key rather than a zero time.
+func TestIngestItem_PersistsSourceUpdatedAt(t *testing.T) {
+	ds := &types.DataSource{ID: "ds-1", TenantID: 1, KnowledgeBaseID: "kb-1"}
+	edited := time.Date(2023, 4, 5, 6, 7, 8, 0, time.FixedZone("CST", 8*3600))
+
+	repo := &deletionLookupKnowledgeRepo{}
+	ks := &sweepFakeKS{repo: repo, createURLKnowledge: &types.Knowledge{ID: "url-knowledge-1"}}
+	svc := &DataSourceService{knowledgeService: ks}
+	created := time.Date(2021, 1, 2, 3, 4, 5, 0, time.UTC)
+	_, err := svc.ingestItem(context.Background(), ds, &types.FetchedItem{
+		ExternalID: "url:1",
+		URL:        "https://example.com/doc",
+		UpdatedAt:  edited,
+		CreatedAt:  created,
+	}, nil)
+	require.NoError(t, err)
+	require.Len(t, repo.metadataUpdates, 1)
+	assert.Equal(t, "2023-04-04T22:07:08Z", repo.metadataUpdates[0]["source_updated_at"])
+	assert.Equal(t, "2021-01-02T03:04:05Z", repo.metadataUpdates[0]["source_created_at"])
+
+	repo = &deletionLookupKnowledgeRepo{}
+	ks = &sweepFakeKS{repo: repo, createURLKnowledge: &types.Knowledge{ID: "url-knowledge-2"}}
+	svc = &DataSourceService{knowledgeService: ks}
+	_, err = svc.ingestItem(context.Background(), ds, &types.FetchedItem{
+		ExternalID: "url:2",
+		URL:        "https://example.com/doc2",
+	}, nil)
+	require.NoError(t, err)
+	require.Len(t, repo.metadataUpdates, 1)
+	_, present := repo.metadataUpdates[0]["source_updated_at"]
+	assert.False(t, present)
+	_, present = repo.metadataUpdates[0]["source_created_at"]
+	assert.False(t, present)
 }
 
 func TestProcessSync_SyncDeletionsDeletesMatchingKnowledge(t *testing.T) {

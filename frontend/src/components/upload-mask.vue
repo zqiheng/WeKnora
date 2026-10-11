@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { useI18n } from 'vue-i18n'
-const { t } = useI18n()
+import { MAX_FILE_SIZE_MB } from '@/utils'
 </script>
 <template>
     <div class="mask">
         <img class="upload-mask-img" src="@/assets/img/upload-mask.svg" alt="">
         <span class="drag-txt">{{ $t('file.upload') }}</span>
-        <span class="drag-type-txt">{{ $t('knowledgeBase.pdfDocFormat') }}</span>
-        <span class="drag-type-txt">{{ $t('knowledgeBase.textMarkdownFormat') }}</span>
+        <span class="drag-type-txt">{{ $t('knowledgeBase.pdfDocFormat', { size: MAX_FILE_SIZE_MB }) }}</span>
+        <span class="drag-type-txt">{{ $t('knowledgeBase.textMarkdownFormat', { size: MAX_FILE_SIZE_MB }) }}</span>
     </div>
 </template>
 <style scoped lang="less">
@@ -20,7 +19,7 @@ const { t } = useI18n()
 .drag-txt {
     color: var(--td-brand-color);
     font-family: var(--app-font-family);
-    font-size: 24px;
+    font-size: var(--app-text-4xl);
     font-weight: 600;
     line-height: 26px;
     display: inline-block;
@@ -32,7 +31,7 @@ const { t } = useI18n()
     color: var(--td-text-color-disabled);
     text-align: center;
     font-family: var(--app-font-family);
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     font-weight: 400;
 }
 .upload-img{

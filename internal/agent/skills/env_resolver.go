@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 )
 
@@ -12,13 +13,16 @@ import (
 // lives in the service layer, which can reach the repository.
 //
 // It is keyed by skill NAME rather than id because every path into the manager
-// is name-addressed: ExecuteScript receives the name the model wrote, and the
+// is name-addressed: shell_exec receives the name the model wrote, and the
 // row id is an implementation detail of the installed-skill source.
 type SkillEnvResolver interface {
 	// ResolveEnv returns the values to inject and the names of any required
-	// variable that neither the admin nor this caller has filled in. An empty
-	// skillName asks for the caller's config-wide variables alone. The caller's
-	// identity is taken from ctx, never from a parameter.
+	// variable that neither the admin, this caller, nor the sandbox config's
+	// create-time env_vars has filled in. Create-time names satisfy required
+	// but are not in the returned map: they were baked into the sandbox at
+	// creation and must not be re-injected per exec. An empty skillName asks
+	// for the caller's config-wide variables alone. The caller's identity is
+	// taken from ctx, never from a parameter.
 	ResolveEnv(ctx context.Context, skillName string) (env map[string]string, missing []string, err error)
 }
 
@@ -34,9 +38,8 @@ type MissingSkillEnvError struct {
 func (e *MissingSkillEnvError) Error() string {
 	// English, like every other error in this codebase: the agent relays this
 	// to the user and translates it into whatever language they are speaking.
-	// execute_skill_script has no env parameter, so it cannot take a value the
-	// user just typed. shell_exec can: naming the skill and passing the value
-	// in env runs the command and stores the value for the next run. Pointing
+	// Naming the skill and passing a user-provided value in shell_exec's env
+	// runs the command and records it after success for the next run. Pointing
 	// at the settings page alone would strand IM users, who have no such page.
 	return fmt.Sprintf(
 		"skill %q needs the environment variable(s) %s, which nobody has set yet. "+
@@ -47,8 +50,9 @@ func (e *MissingSkillEnvError) Error() string {
 	)
 }
 
-// applyResolvedEnv overlays resolved onto env WITHOUT displacing anything env
-// already carries.
+// ApplyResolvedEnv overlays resolved onto env WITHOUT displacing anything env
+// already carries. It is exported because shell_exec applies the same overlay
+// for its optional skill_name parameter and must not diverge from it.
 //
 // This is the second layer of reserved-name protection. Task 2's write-time
 // blacklist is the first, but a value written before that blacklist existed
@@ -56,11 +60,35 @@ func (e *MissingSkillEnvError) Error() string {
 // WEKNORA_SKILL_OUTPUT_DIR would silently redirect the turn's artifacts to a
 // directory nobody drains. Skipping existing keys makes that impossible
 // regardless of what is stored.
-func applyResolvedEnv(env, resolved map[string]string) {
+func ApplyResolvedEnv(env, resolved map[string]string) {
 	for name, value := range resolved {
 		if _, taken := env[name]; taken {
 			continue
 		}
 		env[name] = value
 	}
+}
+
+// applySkillNodePath puts the skill's own node_modules on NODE_PATH, after
+// anything the caller supplied.
+//
+// Python gets no equivalent on purpose. Its dependencies are reached through
+// the skill's own virtualenv interpreter, which the shell wrapper puts first
+// on PATH and which already carries its site-packages. A PYTHONPATH entry
+// would have to name that site-packages directory by interpreter version to
+// be importable at all, and pointing it at the venv root — as an overlay-era
+// path did — resolves nothing.
+func applySkillNodePath(env map[string]string, skillDir string) {
+	if env == nil || skillDir == "" {
+		return
+	}
+	appendPathEnv(env, nodePathEnvVar, path.Join(skillDir, "node_modules"))
+}
+
+func appendPathEnv(env map[string]string, key, dir string) {
+	if existing := strings.TrimSpace(env[key]); existing != "" {
+		env[key] = existing + ":" + dir
+		return
+	}
+	env[key] = dir
 }

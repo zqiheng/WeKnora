@@ -13,7 +13,7 @@ import { providerLogo } from '@/views/settings/providerLogos'
 // Vendors we ship a logo for (Docker) win over the generic TDesign glyphs.
 const props = withDefaults(defineProps<{
   type: string
-  size?: 'sm' | 'md'
+  size?: 'xs' | 'sm' | 'md'
 }>(), { size: 'md' })
 
 const logo = computed(() => providerLogo('sandbox', props.type))
@@ -56,7 +56,14 @@ const badgeStyle = computed((): Record<string, string> => (
   width: 26px;
   height: 26px;
   border-radius: 7px;
-  font-size: 14px;
+  font-size: var(--app-text-base);
+}
+
+.sandbox-badge--xs {
+  width: 16px;
+  height: 16px;
+  border-radius: var(--app-radius-xs);
+  font-size: var(--app-text-2xs);
 }
 
 .sandbox-badge--e2b {
@@ -90,5 +97,10 @@ const badgeStyle = computed((): Record<string, string> => (
 .sandbox-badge--sm.sandbox-badge--mono::before {
   width: 16px;
   height: 16px;
+}
+
+.sandbox-badge--xs.sandbox-badge--mono::before {
+  width: 10px;
+  height: 10px;
 }
 </style>

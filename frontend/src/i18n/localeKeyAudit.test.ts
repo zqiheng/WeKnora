@@ -51,6 +51,15 @@ test('critical runtime i18n trees are present', () => {
   assert.deepEqual(missing, [], missing.join('\n'))
 })
 
+test('installer command progress messages resolve in the settings namespace', () => {
+  for (const [locale, bundle] of Object.entries(LOCALE_BUNDLES)) {
+    for (const name of ['installCommandRunning', 'installCommandWaiting']) {
+      const key = `settings.sandbox.${name}`
+      assert.equal(typeof getLocaleValueAtPath(bundle, key), 'string', `${locale}: missing ${key}`)
+    }
+  }
+})
+
 test('referenced i18n keys used in app code exist in every locale', () => {
   const failures = findUsedKeysMissingInLocales(referencedKeys, localeKeysByName)
   assert.deepEqual(failures, [], failures.slice(0, 20).join('\n'))
@@ -196,7 +205,9 @@ test('prune rebuild restores registered audit keys from baked-in English default
   const emptyBundles = {
     'en-US': {},
     'zh-CN': {},
+    'zh-TW': {},
     'ko-KR': {},
+    'ja-JP': {},
     'ru-RU': {},
   } as Record<LocaleName, Record<string, unknown>>
   const rebuilt = rebuildPrunedLocales(emptyBundles, usage)
@@ -280,4 +291,42 @@ test('locale messages compile with vue-i18n syntax rules', () => {
     (failure) => `${failure.path}: ${failure.message}\n  ${failure.value}`,
   )
   assert.deepEqual(summary, [], summary.slice(0, 20).join('\n'))
+})
+
+test('Seafile picker texts and sync error codes remain localized after pruning', () => {
+  const seafileErrors = [
+    'permission_denied', 'not_found', 'file_too_large', 'empty_file',
+    'source_changed', 'invalid_response', 'ssrf_blocked', 'fetch_failed',
+  ]
+  const keys = [
+    'connector.seafile', 'connectorDesc.seafile',
+    'seafile.baseUrl', 'seafile.apiToken', 'seafile.apiTokenHint',
+    'seafile.singleLibraryOnly', 'seafile.selectionRequired',
+    'resourceType.library', 'noResourcesDesc_seafile',
+    ...[1, 2, 3].map(step => `guideStep${step}_seafile`),
+    ...seafileErrors.map(code => `syncError.seafile_${code}`),
+  ].map(key => `datasource.${key}`)
+  keys.push('knowledgeBase.channelSeafile')
+  for (const key of keys) {
+    assert.ok(referencedKeys.has(key), `pruning would remove ${key}`)
+    for (const [locale, bundle] of Object.entries(LOCALE_BUNDLES)) {
+      assert.equal(typeof getLocaleValueAtPath(bundle, key), 'string', `${locale}: missing ${key}`)
+    }
+  }
+})
+
+test('DingTalk configuration and sync failures remain localized after pruning', () => {
+  const keys = [
+    'connector.dingtalk', 'connectorDesc.dingtalk',
+    'field.clientId', 'field.clientSecret', 'field.operatorId', 'field.operatorIdHint',
+    'prereqBarText_dingtalk', 'prereqOpenConsole_dingtalk',
+    ...[1, 2, 3].flatMap(step => [`prereqStep${step}Brief_dingtalk`, `prereqStep${step}Desc_dingtalk`]),
+    'syncError.dingtalk_document_failed', 'syncError.dingtalk_resource_failed',
+  ].map(key => `datasource.${key}`)
+  for (const key of keys) {
+    assert.ok(referencedKeys.has(key), `pruning would remove ${key}`)
+    for (const [locale, bundle] of Object.entries(LOCALE_BUNDLES)) {
+      assert.equal(typeof getLocaleValueAtPath(bundle, key), 'string', `${locale}: missing ${key}`)
+    }
+  }
 })

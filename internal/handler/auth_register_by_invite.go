@@ -6,6 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
+	"github.com/Tencent/WeKnora/internal/config"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/handler/dto"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -106,7 +108,7 @@ func (h *AuthHandler) LookupInvitationByToken(c *gin.Context) {
 
 // RegisterByInvite godoc
 // @Summary      使用共享链接注册
-// @Description  通过 Owner 生成的共享邀请链接 token 完成注册，绕过 invite_only 模式拦截。
+// @Description  通过共享邀请链接 token 完成注册，仅 self_serve / invite_register 模式允许。
 // @Description  注册者自填邮箱（与 token 不绑定）；注册成功后自动加入对应空间。
 // @Tags         认证
 // @Accept       json
@@ -114,15 +116,20 @@ func (h *AuthHandler) LookupInvitationByToken(c *gin.Context) {
 // @Param        request  body      registerByInviteRequest  true  "邀请注册请求"
 // @Success      201      {object}  types.LoginResponse
 // @Failure      400      {object}  apperrors.AppError  "请求参数错误"
+// @Failure      403      {object}  apperrors.AppError  "注册功能已禁用"
 // @Failure      409      {object}  apperrors.AppError  "邮箱已注册"
 // @Failure      410      {object}  apperrors.AppError  "链接无效或已撤销"
 // @Router       /auth/register-by-invite [post]
 //
-// RegisterByInvite is intentionally NOT subject to the invite_only gate:
-// the gate suppresses public registration, while this endpoint requires
-// a valid token issued by an Owner. The token IS the authorisation.
+// RegisterByInvite requires both an enabled registration mode and a valid token.
 func (h *AuthHandler) RegisterByInvite(c *gin.Context) {
 	ctx := c.Request.Context()
+
+	mode := h.resolveRegistrationMode(ctx)
+	if mode != config.AuthRegistrationModeSelfServe && mode != config.AuthRegistrationModeInviteRegister {
+		_ = c.Error(apperrors.NewForbiddenError("Registration is disabled"))
+		return
+	}
 
 	if h.invitationSvc == nil {
 		c.Error(apperrors.NewInternalServerError("invitation service unavailable"))
@@ -166,6 +173,12 @@ func (h *AuthHandler) RegisterByInvite(c *gin.Context) {
 	if existing, _ := h.userService.GetUserByEmail(ctx, req.Email); existing != nil {
 		c.Error(apperrors.NewConflictError(
 			"this email already has an account; please log in to join the workspace"))
+		return
+	}
+
+	if err := service.ValidatePasswordPolicy(req.Password, h.complexPasswordEnabled(ctx)); err != nil {
+		logger.Error(ctx, "Invalid password policy")
+		_ = c.Error(apperrors.NewValidationError(err.Error()))
 		return
 	}
 

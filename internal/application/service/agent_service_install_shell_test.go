@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stubInstallShellExecutor records the options the privileged executor is
+// stubInstallShellExecutor records the options the install executor is
 // asked for, so a test can prove the difference between the two shell_exec
 // wirings rather than merely that one was registered.
 type stubInstallShellExecutor struct {
@@ -38,7 +38,7 @@ func TestInstallerAgentGetsTheRootShellWithTheSkillsRoot(t *testing.T) {
 		installShell: privileged,
 	}
 	config := &types.AgentConfig{}
-	config.EnableSkillInstallMode(types.BuiltinSkillInstallerID)
+	config.EnableSkillInstallMode(types.BuiltinSkillInstallerID, sandbox.SkillsImageRoot+"/pptx")
 	registry := tools.NewToolRegistry()
 
 	(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, config)
@@ -50,43 +50,42 @@ func TestInstallerAgentGetsTheRootShellWithTheSkillsRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.Success, result.Error)
 	require.False(t, ordinary.called,
-		"the installer must not fall through to the unprivileged executor")
+		"the installer must not fall through to the ordinary executor")
 	require.Len(t, privileged.calls, 1)
 	require.True(t, privileged.calls[0].AsRoot)
 	require.True(t, privileged.calls[0].AllowSkillsRoot)
 	require.Equal(t, sandbox.SkillsImageRoot+"/sk-1", privileged.calls[0].WorkDir)
 }
 
-func TestOrdinaryAgentKeepsTheUnprivilegedShell(t *testing.T) {
-	privileged := &stubInstallShellExecutor{}
-	ordinary := &stubShellExecutor{}
-	mgr := &capableManager{
-		typ:          sandbox.SandboxTypeE2B,
-		shell:        ordinary,
-		installShell: privileged,
+func TestOrdinaryAgentUsesSessionShellForSandboxPaths(t *testing.T) {
+	for _, workDir := range []string{"", sandbox.SessionWorkspaceRoot, sandbox.SessionWorkspaceRoot + "/scratch"} {
+		t.Run(workDir, func(t *testing.T) {
+			installer := &stubInstallShellExecutor{}
+			ordinary := &stubShellExecutor{}
+			mgr := &capableManager{
+				typ:          sandbox.SandboxTypeE2B,
+				shell:        ordinary,
+				installShell: installer,
+			}
+			registry := tools.NewToolRegistry()
+			(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, &types.AgentConfig{})
+
+			args, err := json.Marshal(tools.ShellExecInput{Command: "ls", WorkDir: workDir})
+			require.NoError(t, err)
+			result, err := registry.ExecuteTool(installShellToolContext(), tools.ToolShellExec, args)
+			require.NoError(t, err)
+			require.True(t, result.Success, result.Error)
+			require.True(t, ordinary.called)
+			require.Empty(t, installer.calls,
+				"a sandbox path must not switch ordinary calls to the install executor")
+		})
 	}
-	registry := tools.NewToolRegistry()
-
-	(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, &types.AgentConfig{})
-
-	rejected, err := registry.ExecuteTool(installShellToolContext(), tools.ToolShellExec,
-		json.RawMessage(`{"command":"pip install x","work_dir":"`+sandbox.SkillsImageRoot+`/sk-1"}`))
-	require.NoError(t, err)
-	require.False(t, rejected.Success, "an ordinary agent has no business under /opt")
-
-	accepted, err := registry.ExecuteTool(installShellToolContext(), tools.ToolShellExec,
-		json.RawMessage(`{"command":"ls"}`))
-	require.NoError(t, err)
-	require.True(t, accepted.Success)
-	require.True(t, ordinary.called)
-	require.Empty(t, privileged.calls,
-		"nothing an ordinary agent can ask for may reach the root executor")
 }
 
 func TestInstallModeIsRefusedToEveryAgentButTheInstaller(t *testing.T) {
 	config := &types.AgentConfig{}
 
-	config.EnableSkillInstallMode("some-tenant-agent")
+	config.EnableSkillInstallMode("some-tenant-agent", sandbox.SkillsImageRoot+"/pptx")
 
 	require.False(t, config.SkillInstallMode())
 }
@@ -105,7 +104,7 @@ func TestInstallerAgentConfigTurnsOnInstallMode(t *testing.T) {
 	config := installerAgentConfig(&types.CustomAgent{
 		ID:     types.BuiltinSkillInstallerID,
 		Config: types.CustomAgentConfig{AllowedTools: []string{tools.ToolShellExec}},
-	}, "cfg-1")
+	}, "cfg-1", sandbox.SkillsImageRoot+"/pptx")
 
 	require.True(t, config.SkillInstallMode())
 	require.Equal(t, "none", config.MCPSelectionMode,
@@ -126,7 +125,7 @@ func TestInstallerAgentConfigKeepsMCPOffWhenThePlatformYAMLEnablesIt(t *testing.
 			WebSearchEnabled: true,
 			MemoryEnabled:    &memoryOn,
 		},
-	}, "cfg-1")
+	}, "cfg-1", sandbox.SkillsImageRoot+"/pptx")
 
 	require.Equal(t, "none", config.MCPSelectionMode)
 	require.False(t, config.WebSearchEnabled)
@@ -138,7 +137,7 @@ func TestInstallerAgentConfigLeavesInstallModeOffForAnotherAgent(t *testing.T) {
 	config := installerAgentConfig(&types.CustomAgent{
 		ID:     "agent-42",
 		Config: types.CustomAgentConfig{AllowedTools: []string{tools.ToolShellExec}},
-	}, "cfg-1")
+	}, "cfg-1", sandbox.SkillsImageRoot+"/pptx")
 
 	require.False(t, config.SkillInstallMode())
 }

@@ -1,25 +1,8 @@
 # 文档入库流程（Document Ingestion Pipeline）
 
-本文完整描述 WeKnora 中一篇文档从"上传"到"可检索"的全链路：入口 API → 文件存储 → 异步任务 → 解析（docreader）→ 分块 → 向量化 → 索引写入 → 后处理富化（摘要 / 问题生成 / 图谱 / Wiki / 图片多模态）→ 状态机与进度追踪，以及失败重试、Housekeeping 自愈、删除清理、FAQ 导入与知识克隆/移动等配套链路。
+文档通过文件上传、URL 导入或手动创建进入系统。服务端保存内容并提交处理任务，依次完成解析、分块和索引，再按知识库配置生成摘要、问题、图谱及 Wiki。状态和进度随处理阶段更新，失败任务由重试与巡检机制恢复。
 
-各环节对应的源码位置：
-
-| 环节 | 源码位置 |
-|------|----------|
-| HTTP 入口 | `internal/handler/knowledge.go`、`internal/router/router.go` |
-| 创建与入队 | `internal/application/service/knowledge_create.go`、`knowledge_task_options.go` |
-| 文件存储 | `internal/application/service/file/`（`factory.go`、各后端实现） |
-| 解析基础设施 | `internal/infrastructure/docparser/`、`docreader/`（Python 服务） |
-| 主处理管线 | `internal/application/service/knowledge_process.go` |
-| 处理配置合并 | `internal/application/service/knowledge_process_config.go` |
-| 后处理 | `internal/application/service/knowledge_post_process.go`、`image_multimodal.go` |
-| 进度追踪 | `internal/application/service/knowledge_span_tracker.go`、`internal/types/knowledge_span.go` |
-| 自愈 | `internal/application/service/knowledge_housekeeping.go` |
-| 删除 | `internal/application/service/knowledge_delete.go` |
-| FAQ | `internal/application/service/knowledge_faq.go`、`knowledge_faq_import.go` |
-| 克隆/移动 | `internal/application/service/knowledge_clone_move.go` |
-
-## 1. 总体架构
+## 总体架构 {#_1-总体架构}
 
 WeKnora 的入库链路是一条**基于 Asynq（Redis）的分布式异步管道**。HTTP Handler 只负责落库与入队，所有耗时工作（解析、向量化、LLM 富化）都由独立的 Worker 池消费队列完成。
 
@@ -73,7 +56,7 @@ flowchart TD
     D5 --> E
 ```
 
-## 2. 入口层：三种创建方式
+## 入口层：三种创建方式 {#_2-入口层-三种创建方式}
 
 路由注册在 `internal/router/routes_knowledge.go`：
 
@@ -85,17 +68,17 @@ kb.POST("/manual", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.CreateManu
 
 配套的管理端点：`POST /knowledge/:id/reparse`（重新解析）、`POST /knowledge/:id/cancel-parse`（取消解析）、`POST /knowledge/batch-reparse`、`POST /knowledge/batch-delete`、`POST /knowledge/move`（跨库移动）。
 
-### 2.1 文件上传（CreateKnowledgeFromFile）
+### 文件上传（CreateKnowledgeFromFile） {#_2-1-文件上传-createknowledgefromfile}
 
-- 表单参数：`file`、`fileName`、`metadata`、`enable_multimodel`、`tag_ids`、`process_config`（每次上传可覆盖 KB 级处理配置，见 §5）。
+- 表单参数：`file`、`fileName`、`metadata`、`enable_multimodel`、`tag_ids`、`process_config`（每次上传可覆盖 KB 级处理配置，见 [处理配置：KB 默认值 + 单次上传覆盖](#_5-处理配置-kb-默认值-单次上传覆盖)）。
 - 流程：扩展名校验 → MD5 去重 → `FileService.SaveFile` 存储 → 创建 `Knowledge` 记录 → 入队。
 
-### 2.1.1 统一的扩展名闸门
+### 统一的扩展名闸门 {#_2-1-1-统一的扩展名闸门}
 
 `internal/application/service/knowledge_util.go` 里的 `supportedImportFileExtensions` 是**所有导入路径的唯一事实来源**——直接上传、文件 URL 下载、以及 worker 下载完成后的复检都查同一张表：
 
 ```
-pdf txt docx doc epub html htm mhtml md markdown
+pdf txt docx doc epub html htm mhtml md markdown xmind
 png jpg jpeg gif csv xlsx xls pptx ppt json
 mp3 wav m4a flac ogg
 ```
@@ -106,7 +89,7 @@ mp3 wav m4a flac ogg
 
 图片、音频类文件的额外前置校验（对象存储配置是否完整、VLM / ASR 模型是否配置）与 `process_config` 校验一起收敛到 `resolveFileImportProcessConfig()`，上传与 URL 导入共用。
 
-### 2.2 URL 导入（CreateKnowledgeFromURL）
+### URL 导入（CreateKnowledgeFromURL） {#_2-2-url-导入-createknowledgefromurl}
 
 - JSON Body：`{url, file_name?, file_type?, enable_multimodel?, title?, tag_ids?, channel?, process_config?}`。
 - `isFileURL()` 按上面的统一扩展名集合判断这是「下载文件」还是「抓取网页」。
@@ -121,11 +104,11 @@ if err := secutils.ValidateURLForSSRF(req.URL); err != nil {
 
 Worker 侧在真正抓取前会再次校验（`knowledge_process.go` 的 `convert()`），三重防线防止 TOCTOU。
 
-### 2.3 手动创建（CreateManualKnowledge）
+### 手动创建（CreateManualKnowledge） {#_2-3-手动创建-createmanualknowledge}
 
 - JSON Body 为 `types.ManualKnowledgePayload{Title, Content, Status, TagIDs, Channel, ProcessConfig}`，支持草稿（Draft）状态；发布时走 `triggerManualProcessing()` 进入与文件相同的分块/索引管线（跳过 DocReader 阶段）。
 
-### 2.4 去重机制
+### 去重机制 {#_2-4-去重机制}
 
 `knowledge_create.go` 对上传文件计算 MD5，并按四元组查库：
 
@@ -144,9 +127,9 @@ if exists {
 }
 ```
 
-命中时不重复入库，返回已有 Knowledge 并附带 `DuplicateFileError`（前端据此提示"文件已存在"）。`FileType` 参与判定：重复只在**同一文件类型内**成立，因此内容完全相同的 `notes.md` 与 `notes.txt` 会作为两条独立知识共存（`CheckKnowledgeExists` 在哈希与「文件名 + 大小」两条分支上都追加了 `LOWER(file_type)` 条件）。
+命中时不重复入库，返回已有 Knowledge 并附带 `DuplicateFileError`（前端据此提示"文件已存在"）。`parse_status` 为 `failed` 或 `deleting` 的行不参与查重，因此删除尚未完成或卡在删除中的文件可以重新上传。`FileType` 参与判定：重复只在**同一文件类型内**成立，因此内容完全相同的 `notes.md` 与 `notes.txt` 会作为两条独立知识共存（`CheckKnowledgeExists` 在哈希与「文件名 + 大小」两条分支上都追加了 `LOWER(file_type)` 条件）。
 
-### 2.5 初始状态
+### 初始状态 {#_2-5-初始状态}
 
 新建 Knowledge 记录的关键初始字段（`knowledge_create.go`）：
 
@@ -163,9 +146,9 @@ knowledge := &types.Knowledge{
 
 对 CSV/Excel 数据表类知识，创建后还会额外入队 `TypeDataTableSummary`（`datatable:summary`）任务，生成 `table_summary` / `table_column` 类型的 Chunk 用于表格问答。
 
-## 3. 文件存储层（FileService 与存储后端）
+## 文件存储层（FileService 与存储后端） {#_3-文件存储层-fileservice-与存储后端}
 
-### 3.1 接口定义
+### 接口定义 {#_3-1-接口定义}
 
 `internal/types/interfaces/file.go`：
 
@@ -181,7 +164,7 @@ type FileService interface {
 }
 ```
 
-### 3.2 支持的存储后端
+### 支持的存储后端 {#_3-2-支持的存储后端}
 
 工厂函数 `NewFileServiceFromStorageConfig()`（`internal/application/service/file/factory.go`）根据 `types.StorageEngineConfig.DefaultProvider` 选择后端。实际支持的后端清单：
 
@@ -197,27 +180,27 @@ type FileService interface {
 | `ks3` | `ks3://` | `file/ks3.go` | 金山云 KS3 | `Endpoint/Region/AccessKey/SecretKey/BucketName` |
 | `dummy` | `dummy://` | `file/dummy.go` | 测试用空实现 | 无 |
 
-### 3.3 对象 Key 组织规则
+### 对象 Key 组织规则 {#_3-3-对象-key-组织规则}
 
 - 正式文件：`{tenantID}/{knowledgeID}/{uuid或纳秒时间戳}{ext}`，例如 `local://12345/kb-001/1722045600000000000.pdf`。
 - 导出/临时/克隆产物：`{tenantID}/exports/{fileName}_{timestamp}{ext}`。
 - 路径安全：`secutils.SafePathUnderBase`（防目录穿越）、`secutils.SafeFileName`、对象存储侧 `utils.SafeObjectKey`。
 
-### 3.4 两个包装层
+### 两个包装层 {#_3-4-两个包装层}
 
 - **`backend_scoped.go`**：多存储后端部署时给路径加实例前缀，形如 `storage://{backendID}/{innerPath}`，`wrap/unwrap` 编解码并拒绝跨后端操作。KB 可通过 `StorageBackendID` 绑定到具体后端实例。
 - **`resource_catalog.go`**：把物理路径注册为稳定的 `resource://{uuid}` 引用，支持 `Bind`（资源与 knowledge 等 owner 关联）、`MarkDeleted`、`CreateAccessGrant`（生成临时访问令牌，产出 `/r/{token}` 形式的 URL）。应用层持有 `resource://` 引用即可无感迁移底层存储。
 
-## 4. 异步任务机制（Asynq + Redis）
+## 异步任务机制（Asynq + Redis） {#_4-异步任务机制-asynq-redis}
 
-### 4.1 入队
+### 入队 {#_4-1-入队}
 
 `knowledge_create.go` 组装 `types.DocumentProcessPayload`（含 `TenantID/KnowledgeID/KnowledgeBaseID/FilePath/FileName/FileType/EnableMultimodel/EnableQuestionGeneration/QuestionCount/Language/Attempt` 等），任务选项来自 `knowledge_task_options.go`：
 
 ```go
 opts := []asynq.Option{
     asynq.Queue(types.QueueDefault),
-    asynq.Timeout(config.DocumentProcessTimeout(cfg)), // 默认 30 分钟
+    asynq.Timeout(config.DocumentProcessTimeout(cfg)), // 默认 2 小时
     asynq.MaxRetry(3),                                  // 失败最多重试 3 次
 }
 task := asynq.NewTask(types.TypeDocumentProcess, payloadBytes, opts...)
@@ -226,27 +209,33 @@ info, err := s.task.Enqueue(task)
 
 入队失败时会将 `ParseStatus` 置为 `failed`（文件已保存，可通过 reparse 重新触发）。
 
-### 4.2 队列拓扑与 Worker 池
+### 队列拓扑与 Worker 池 {#_4-2-队列拓扑与-worker-池}
 
 `internal/types/task.go` 定义的队列：
 
 | 队列常量 | 名称 | 用途 |
 |----------|------|------|
 | `QueueDefault` | `default` | 核心文档处理（解析/分块/嵌入/索引） |
+| `QueueChatAttachment` | `chat_attachment` | 会话临时文档解析 |
 | `QueuePostProcess` | `postprocess` | 后处理编排任务 |
-| `QueueSummary` | `summary` | 摘要 / 问题生成类 LLM 任务 |
+| `QueueSummary` | `summary` | 摘要、表格摘要、自动标签、知识库描述 |
 | `QueueMultimodal` | `multimodal` | 图片 OCR / VLM Caption |
-| `QueueMaintenance` | `low` | 维护类任务（FAQ 批量导入等） |
+| `QueueQuestion` | `question` | 问题生成 |
+| `QueueGraph` | `graph` | 图谱抽取 |
+| `QueueWiki` | `wiki` | Wiki 生成与收尾 |
+| `QueueMaintenance` | `low` | 维护类任务（FAQ 批量导入、知识库复制/删除、批量删除/重解析、移动等） |
 
-默认并发数（`internal/types/task.go`）：核心池 `DefaultCoreWorkerConcurrency = 8`、后处理池 `2`、富化池 `12`、维护池 `4`。
+另有 `sync`（数据源同步）与 `memory`（个人记忆抽取）队列。默认并发数（`internal/types/task.go`）：核心池 `DefaultCoreWorkerConcurrency = 8`、后处理池 `2`、富化池 `12`、维护池 `4`、弹性共享池 `6`、Wiki 池 `8`，完整拓扑见[异步任务系统](05-async-tasks.md#_4-1-六个独立-worker-pool)。
 
-### 4.3 失败重试语义
+### 失败重试语义 {#_4-3-失败重试语义}
 
-- `TypeDocumentProcess`：`MaxRetry(3)` → 初始 + 3 次重试共 4 次尝试；每次尝试受 `DocumentProcessTimeout`（默认 30 分钟）约束。
+- `TypeDocumentProcess`：`MaxRetry(3)` → 初始 + 3 次重试共 4 次尝试；每次尝试受 `DocumentProcessTimeout`（默认 2 小时，环境变量 `WEKNORA_DOCUMENT_PROCESS_TIMEOUT`）约束，其中单次 docreader 调用另受 `WEKNORA_DOCREADER_CALL_TIMEOUT`（默认 30 分钟）约束。
+- 处理函数内的 panic 会被转换为错误交给重试与死信流程，最后一次失败时文档标为 `failed`；Lite 模式的执行器同样捕获 panic，不会导致进程退出。
 - Payload 携带 `Attempt`（重新解析时取历史最大 attempt+1）；Span Tracker 用 attempt 隔离每轮处理的进度树，新 attempt 会"取代"（supersede）旧任务的收尾动作。
-- 处理函数区分"是否最后一次 asynq 尝试"（`isLastRetry`）：非最后一次的失败直接返回错误让 asynq 重试，最后一次才把 `ParseStatus` 落为 `failed` 并写 `ErrorMessage`。
+- 处理函数区分"是否最后一次 asynq 尝试"（`isLastRetry`）：非最后一次的失败直接返回错误让 asynq 重试，最后一次才把 `ParseStatus` 落为 `failed` 并写 `ErrorMessage`。读租户、读知识行或写 `processing` 状态时遇到数据库瞬时错误也返回错误重试，不再直接确认任务；只有知识行确实不存在时才静默结束。
+- 重新解析：只有覆盖配置校验、旧资源清理都通过后才分配新 attempt，被拒绝的重新解析不会影响正在进行的上一轮。上一轮仍在进行（`pending` / `processing` / `finalizing`）时，先取消它排队中的任务并通知运行中的任务停止。属于旧 attempt 的任务一律跳过：`ProcessDocument`、分块写库、后处理、图片多模态任务不再写行、删 chunk 或扣计数；Wiki 操作带着入队时的 attempt，过期后不再释放新一轮的计数；死信回调也不会把新一轮标为 `failed`。
 
-## 5. 处理配置：KB 默认值 + 单次上传覆盖
+## 处理配置：KB 默认值 + 单次上传覆盖 {#_5-处理配置-kb-默认值-单次上传覆盖}
 
 `knowledge_process_config.go` 的 `ResolveProcessConfig(kb, overrides)` 把 KB 默认配置与上传时携带的 `process_config`（`types.KnowledgeProcessOverrides`）合并为 `types.EffectiveProcessConfig`：
 
@@ -268,13 +257,13 @@ type IndexingStrategy struct {
 
 `NeedsEmbedding() = Vector || Keyword`，`NeedsChunks() = 任一开启`。默认值为 vector+keyword 开启。
 
-## 6. 核心处理管线（knowledge_process.go）
+## 核心处理管线（knowledge_process.go） {#_6-核心处理管线-knowledge-process-go}
 
-Worker 消费 `TypeDocumentProcess` 后按五个规范化阶段推进，每个阶段对应一个 Span（见 §8）：
+Worker 消费 `TypeDocumentProcess` 后按五个规范化阶段推进，每个阶段对应一个 Span（见 [Housekeeping 自愈（knowledge_housekeeping.go）](#_8-housekeeping-自愈-knowledge-housekeeping-go)）：
 
 `docreader → chunking → embedding → multimodal → postprocess`
 
-### 6.1 解析（convert，Stage: docreader）
+### 解析（convert，Stage: docreader） {#_6-1-解析-convert-stage-docreader}
 
 1. `beginStage(StageDocReader)` 记录输入（file_name/file_type/is_url）。
 2. URL 模式再次 `ValidateURLForSSRF`，失败即 `failStage` + `ParseStatus=failed`。
@@ -282,15 +271,15 @@ Worker 消费 `TypeDocumentProcess` 后按五个规范化阶段推进，每个�
 4. `resolveDocReader` 返回 `interfaces.DocReader`：
    - **builtin**：通过 gRPC（`docparser/grpc_parser.go`）或 HTTP（`http_parser.go`）调用 Python **docreader** 服务；
    - **simple**：Go 原生解析 md/txt/csv/json/图片/音频（`builtin_converter.go`，CSV→Markdown 表格、JSON→递归分割的代码块，图片/音频转占位引用）；
-   - **anydoc**：Go 进程内解析 docx/doc/pptx/ppt/xlsx/xls/odf/rtf/epub/csv/pdf（`anydoc_reader.go`），底层是通过 cgo 链接的 anydoc Rust 库。office 文档的嵌入图按文档模型插回 Markdown 原位；无文字层的扫描件 PDF 在 DocReader 可用时回退到 builtin 整页渲染。仅在带 `anydoc` 构建标签的二进制中可用，其余构建里该引擎在引擎列表中显示为不可用；
-   - **weknoracloud / mineru / mineru_cloud / paddleocr_vl / paddleocr_vl_cloud**：HTTP 转换器（`engines.go` 注册，按 `mineru_endpoint`、`mineru_api_key`、`paddleocr_vl_endpoint` 等配置判定可用性）。
+   - **anydoc**：Go 进程内解析 docx/doc/pptx/ppt/xlsx/xls/odf/rtf/epub/csv/pdf（`anydoc_reader.go`），底层是通过 cgo 链接的 anydoc Rust 库。office 文档的嵌入图按文档模型插回 Markdown 原位；无文字层的扫描件 PDF 在 DocReader 可用时回退到 builtin 整页渲染。链接了 anydoc 时，未配置规则的复杂格式默认走 anydoc，但 PDF 默认仍走 builtin。仅在带 `anydoc` 构建标签的二进制中可用，其余构建里该引擎在引擎列表中显示为不可用；
+   - **weknoracloud / mineru / mineru_cloud / paddleocr_vl / paddleocr_vl_cloud**：HTTP 转换器（`engines.go` 注册，按 `mineru_endpoint`、`mineru_api_key`、`paddleocr_vl_endpoint` 等配置判定可用性；自建 `mineru` 会自动识别 MinerU 4.0 的 V1 API 与旧版 `/file_parse`，见[文档解析服务](../03-features/03-document-parsing.md#mineru-self-hosted)）。
 
 引擎目录集中在 `internal/infrastructure/docparser/engines.go`：每个引擎同时声明元数据（名称、描述、文件类型、可用性探针）与 `NewReader` 工厂，`docparser.NewReader` 按名字分发，未注册的名字（如只存在于 docreader 的 `markitdown`）落到 docreader 客户端。
 5. 文件模式：从 `FileService.GetFile(payload.FilePath)` 读回字节填入 `ReadRequest.FileContent`。
 
-**docreader 服务侧**（`docreader/`，Python gRPC）：proto 定义 `docreader/proto/docreader.proto`，服务方法 `Read` / `ReadStream`（流式：首帧 meta + 每图一帧，避免大扫描件 PDF 触发 gRPC 消息上限）/ `ListEngines`。内置 parser 覆盖 docx/doc/pdf/md/xlsx/xls/epub/html/htm/mhtml/图片/网页（`WebParser` 处理 URL），并可选注册 `markitdown`（微软 MarkItDown）与 `opendataloader`（PDF 版面分析，需 Java 11+）引擎，Go 侧通过 `ListEngines` 自发现远程引擎。返回统一为 `ReadResult{MarkdownContent, ImageRefs, Metadata, IsAudio, AudioData}` —— **解析产物统一是 Markdown 文本 + 图片字节**，图片持久化由 Go 侧负责。
+**docreader 服务侧**（`docreader/`，Python gRPC）：proto 定义 `docreader/proto/docreader.proto`，服务方法 `Read` / `ReadStream`（流式：首帧 meta + 每图一帧，避免大扫描件 PDF 触发 gRPC 消息上限）/ `ListEngines`。内置 parser 覆盖 docx/doc/pdf/md/xlsx/xls/pptx/ppt/epub/html/htm/mhtml/xmind/图片/网页（`WebParser` 处理 URL），另注册 `markitdown`（微软 MarkItDown）与 `opendataloader`（PDF 版面分析，需 Java 11+）引擎；引擎列表由 Go 侧 `engine_registry.go` 维护，Go App 不再调用 `ListEngines`。返回统一为 `ReadResult{MarkdownContent, ImageRefs, Metadata, IsAudio, AudioData}` —— **解析产物统一是 Markdown 文本 + 图片字节**，图片持久化由 Go 侧负责。
 
-### 6.2 ASR 转写（音频文件）
+### ASR 转写（音频文件） {#_6-2-asr-转写-音频文件}
 
 `convertResult.IsAudio` 为真时（音频文件解析为占位符 + 原始字节）：
 
@@ -301,7 +290,7 @@ transcriptionResult, err := asrModel.Transcribe(ctx, convertResult.AudioData, kn
 
 转写文本替换 MarkdownContent 后继续走普通文本管线；未配置 ASR 则直接失败。
 
-### 6.3 图片提取与上传
+### 图片提取与上传 {#_6-3-图片提取与上传}
 
 `docparser/image_resolver.go` 的 `ImageResolver.ResolveAndStore`：
 
@@ -312,7 +301,7 @@ transcriptionResult, err := asrModel.Transcribe(ctx, convertResult.AudioData, kn
 
 随后 `ResolveRemoteImages` 再把 Markdown 里的外部 `http(s)` 图片下载转存（同样受 SSRF 防护）。产出 `storedImages []docparser.StoredImage` 供多模态阶段使用。
 
-### 6.4 分块（Stage: chunking）
+### 分块（Stage: chunking） {#_6-4-分块-stage-chunking}
 
 分块在 **Go 侧**完成（`internal/infrastructure/chunker`，详见《分块机制》一章）：
 
@@ -327,14 +316,14 @@ if eff.ChunkingConfig.EnableParentChild {
 }
 ```
 
-### 6.5 写库与索引（processChunks，Stage: chunking + embedding）
+### 写库与索引（processChunks，Stage: chunking + embedding） {#_6-5-写库与索引-processchunks-stage-chunking-embedding}
 
 `processChunks` 是核心装配函数：
 
 1. **父块**（父子分块模式）：为每个 parent 建 `ChunkTypeParentText` 记录，串好 `PreChunkID/NextChunkID` 链表；父块**只入 DB、不进向量索引**（检索命中子块后回捞父块内容）。
-2. **文本块**：每个 `ParsedChunk` 建 `ChunkTypeText` 记录，携带 `StartAt/EndAt`（原文 rune 偏移，可用于还原/高亮）与内存态 `ContextHeader`（标题面包屑，不落库）；父子模式下写 `ParentChunkID`。
+2. **文本块**：每个 `ParsedChunk` 建 `ChunkTypeText` 记录，携带 `StartAt/EndAt`（原文 rune 偏移，可用于还原/高亮）与 `ContextHeader`（标题面包屑，存入 `chunks.context_header`，接口响应不返回）；父子模式下写 `ParentChunkID`。分块前，各解析引擎输出的内联 HTML 表格统一转换为 Markdown 表格（`NormalizeHTMLTables`）。
 3. `chunkService.CreateChunks(ctx, insertChunks)` 批量写库；失败则 `ParseStatus=failed` + `failStage(StageChunking)`。
-4. **向量化与索引**（`kb.NeedsEmbeddingModel()` 时）：
+4. **向量化与索引**（`kb.NeedsEmbeddingModel()` 时）。Embedding 模型或知识库绑定的向量存储无法解析时（模型被删、凭据失效等），本次尝试直接失败并在 `error_message` 记录原因，不会停留在 `processing`：
 
 ```go
 indexContent := titlePrefix + chunk.EmbeddingContent() // 标题 + 面包屑 + 内容
@@ -346,26 +335,28 @@ err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
 ```
 
    索引失败时执行**补偿回滚**：删除已写入的 chunks（`DeleteChunksByKnowledgeID`）并清向量索引（`DeleteByKnowledgeIDList`），置 `failed`，保证不留半成品。
-5. **图片多模态任务扇出**：`enableMultimodel && len(storedImages) > 0` 时，`enqueueImageMultimodalTasks` 为**每张图片**入队一个 `TypeImageMultimodal` 任务（`QueueMultimodal`），payload 含 `ImageURL/EnableOCR/EnableCaption/Attempt/ImageIndex`。
+5. **图片多模态任务扇出**：`enableMultimodel && len(storedImages) > 0` 时，`enqueueImageMultimodalTasks` 为**每张图片**入队一个 `TypeImageMultimodal` 任务（`QueueMultimodal`），payload 含 `ImageURL/EnableOCR/EnableCaption/Attempt/ImageIndex`。个别图片入队失败时立即释放对应的计数；全部入队失败时直接进入后处理，避免文档卡在 `processing`。
 6. `finalizeIndexedKnowledgeState`：若还有多模态/后处理要跑则保持 `processing`，否则直接 `completed`；同时置 `EnableStatus="enabled"`（此刻文档即可被检索）并累计租户存储用量。
 
-### 6.6 后处理编排（knowledge_post_process.go，Stage: postprocess）
+### 后处理编排（knowledge_post_process.go，Stage: postprocess） {#_6-6-后处理编排-knowledge-post-process-go-stage-postprocess}
 
 多模态全部完成（或无多模态）后入队 `TypeKnowledgePostProcess`。该任务是**富化子任务的编排器**，用原子计数器保证终态收敛：
 
 ```go
-willSpawnSummary  := len(textChunks) > 0
-willSpawnQuestion := willSpawnSummary && kb.NeedsEmbeddingModel() && eff.QuestionGenerationConfig.Enabled
+willSpawnSummary  := eff.SummaryEnabled && len(textChunks) > 0   // 单次上传可关闭摘要
+willSpawnQuestion := len(textChunks) > 0 && kb.NeedsEmbeddingModel() && eff.QuestionGenerationConfig.Enabled
 willSpawnWiki     := kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0
-willSpawnGraph    := eff.GraphEnabled && len(textChunks) > 0
-// questionGenChunkBatchSize = 20：问题生成按每 20 个 chunk 一批
-expectedSubtasks = summary(0/1) + questionBatchCount + wiki(0/1) + graphChunkCount
+graphChunks       := selectGraphChunks(textChunks)                // 见下文
+// questionGenChunkBatchSize = 20：问题生成按每 20 个 chunk 一批（跳过只有图片链接的 chunk）
+expectedSubtasks = summary(0/1) + questionBatchCount + wiki(0/1) + len(graphChunks)(图谱开启时)
 
 // 原子地把 parse_status 从 processing 提升为 finalizing，并写入 pending_subtasks_count
 promoted, err := s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expectedSubtasks)
 ```
 
 - `expectedSubtasks == 0` 走快速路径直接 `completed`。
+- 图谱抽取的输入（`selectGraphChunks`）：有正文的文本块；只有图片链接的文本块（如扫描件 PDF 页）改用其 `image_ocr` 子块；`image_caption` 子块不参与，避免与 OCR 重复。
+- `processing → finalizing` 的状态写入失败时任务返回错误交给 asynq 重试，不会误报成功而让文档停在 `processing`。
 - 每个子任务终态退出时调用 `FinalizeSubtask` 原子递减 `pending_subtasks_count`，减到 0 时自动升级为 `completed`。
 - **短缺协调**：若实际入队数少于计划数（如某队列入队失败），立即补偿递减差额，防止永远卡在 `finalizing`。
 - `finalizeSubtaskDetached`（`knowledge.go`）：递减动作使用 `context.WithoutCancel` + 10 秒超时的**脱离上下文**执行，避免 worker 优雅退出时 ctx 取消导致计数丢失、知识永久滞留 `finalizing`。
@@ -374,10 +365,18 @@ promoted, err := s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expecte
 
 | 任务 | 队列 | 粒度 | 说明 |
 |------|------|------|------|
-| `TypeSummaryGeneration` | `summary` | 每知识 1 个 | 生成文档摘要，`summary_status` 独立状态机 |
+| `TypeSummaryGeneration` | `summary` | 每知识 1 个 | 生成文档摘要，`summary_status` 独立状态机；上传时 `process_config.summary_enabled=false` 则不生成 |
 | `TypeQuestionGeneration` | question 队列 | 每 20 个 chunk 一批 | 为 chunk 生成检索问题 |
 | `TypeChunkExtract` | graph 队列 | 每 chunk 1 个 | 实体/关系抽取写入图引擎 |
 | `TypeWikiIngest` | wiki 队列 | 防抖批量 | 生成/更新 Wiki 页面 |
+
+#### 文档自动标签
+
+解析后的后处理会按知识库 auto_tag_config 决定是否入队 knowledge:auto_tag（summary 队列）。处理器从当前 KB 已有标签中选择，模型回退 summary_model_id；max_tags 默认 3、上限 10，默认跳过已有标签文档。它只增量关联标签，不创建新分类，也不删除人工标签；失败不阻断文档入库。配置与新解析/重解析的生效范围见[知识库管理](../03-features/02-knowledge-base.md)。
+
+#### 知识库描述刷新（knowledgebase_profile.go）
+
+摘要任务的每次终态退出、后处理调度完成、文档删除、跨库移动完成，都会调用 `requestKnowledgeBaseProfileRefresh` 入队一次 `kb:profile`（summary 队列）。任务 ID 按知识库和 30 秒窗口分桶，一批上传或删除只触发一次聚合；处理器重算文档画像聚合，哈希未变则不调用模型。只有 `profile_config.enabled` 的文档知识库会入队，手动触发（`POST /knowledge-bases/:id/profile/generate`）不受此限制。
 
 #### 摘要刷新（knowledge_summary_refresh.go）
 
@@ -386,21 +385,23 @@ promoted, err := s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expecte
 - 任务开始时记录输入快照：各源分块的 `content_revision` / `is_enabled`，以及 `custom_metadata` 的版本；
 - 生成完成后用 `summarySourceChanged()` 复核快照。若期间又被编辑，返回 `ErrSummaryRefreshStale`，**丢弃本次结果且不改动 `summary_status`**，让更新的那次刷新收尾——否则旧摘要会覆盖新摘要；
 - 数据库读取失败与「输入已变更」分开处理，避免把瞬时读错误当成过期任务静默丢弃；
-- 刷新跑在 Asynq worker 里，没有 HTTP 中间件注入的租户上下文，因此 `restoreSummaryRefreshTenantInfo()` 会重建完整租户配置——检索引擎工厂需要它。
+- 刷新任务由 Asynq worker 执行，没有 HTTP 中间件注入的租户上下文，因此 `restoreSummaryRefreshTenantInfo()` 会重建完整租户配置——检索引擎工厂需要它。
 
-### 6.7 图片多模态（image_multimodal.go）
+### 图片多模态（image_multimodal.go） {#_6-7-图片多模态-image-multimodal-go}
 
 `ImageMultimodalService.Handle` 消费单图任务：
 
 1. `readImageBytes` 从存储/URL 取图；`resolveVLM` 取 KB 的 VLM 配置；
 2. 生成 Caption（VLM，prompt 由 `buildVLMCaptionPrompt` 按 `DescriptionLanguage/CustomInstructions` 组装）与 OCR 文本；
 3. 结果写回所属文本 Chunk 的 `ImageInfo`（JSON），并创建/更新两个**子 Chunk**：`ChunkTypeImageCaption` 与 `ChunkTypeImageOCR`，`ParentChunkID` 指向文本块，随后单独 `indexChunks` 入向量索引 —— 使"搜图片描述也能召回原文块"；
+   - **图片向量**：知识库开启了图片向量（`ImageProcessingConfig.ImageVectorEnabled`，默认关闭，见 `KnowledgeBase.IsImageVectorEnabled`）且向量模型能处理图片时（模型能力 `input` 含 `image`，且厂商协议能传图片，见 `embedding.AsImageEmbedder`），`indexImageVector` 再用该模型直接对图片编码，存为第三个子 Chunk `ChunkTypeImageVector`：索引行的 `SourceType` 为 `ImageSourceType`，向量是图片本身的（经 `CompositeRetrieveEngine.BatchIndexVectors` 写入预先算好的向量），`Content` 复用图片描述（没有描述时用 OCR 文本），供重排与回答上下文使用。图片先经 `imageprep.Prepare` 按厂商限制转格式、压缩；扫描件 PDF 页不做（OCR 更准）。这一步失败只记日志，不影响任务；
+   - `ChunkTypeImageVector` 的向量不能由文本重建：`syncChunkIndex` 对它只同步启用状态，`updateChunkVector` 跳过它；图片描述被修改时只更新它的 `Content`；
 4. `shouldDropOrphanedMultimodal` 检查父块是否已被删除/取代，孤儿任务直接丢弃；
-5. `checkAndFinalizeAllImages`：全部图片处理完毕后，`enqueueKnowledgePostProcessTask` 触发 §6.6 的后处理编排。
+5. `checkAndFinalizeAllImages`：全部图片处理完毕后，`enqueueKnowledgePostProcessTask` 触发 [后处理编排（knowledge_post_process.go，Stage: postprocess）](#_6-6-后处理编排-knowledge-post-process-go-stage-postprocess) 的后处理编排。后处理任务入队会就地重试 3 次，仍失败时本次任务返回错误交给重试，不会确认任务后让文档停在 `processing`。最后一次尝试时即使读取知识行失败，这张图片也会计入完成数。Lite 模式没有 Redis，计数器保存在进程内存中，所有图片都完成后才进入后处理。
 
-## 7. 状态机
+## 状态机 {#_7-状态机}
 
-### 7.1 Knowledge 主状态（ParseStatus）
+### Knowledge 主状态（ParseStatus） {#_7-1-knowledge-主状态-parsestatus}
 
 `internal/types/knowledge.go` 定义的完整取值：
 
@@ -411,7 +412,7 @@ promoted, err := s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expecte
 | `finalizing` | 主流程完成，等待富化子任务（`pending_subtasks_count > 0`） |
 | `completed` | 全部完成 |
 | `failed` | 处理失败（`ErrorMessage` 记录原因） |
-| `deleting` | 删除中（防并发标记） |
+| `deleting` | 删除中（防并发标记；不计入知识库文档数，也不参与重复文件判定） |
 | `cancelled` | 用户取消解析 |
 
 辅助状态：`EnableStatus ∈ {enabled, disabled}`（是否可检索，索引成功即 enabled，不等富化）；`SummaryStatus ∈ {none, pending, processing, completed, failed}`。
@@ -434,19 +435,20 @@ stateDiagram-v2
     failed --> deleting: DeleteKnowledge
     processing --> failed: housekeeping 判定卡死<br/>心跳超时且无排队任务
     finalizing --> failed: housekeeping 判定卡死
+    deleting --> failed: housekeeping 判定删除任务丢失
     deleting --> [*]: 清理完成后删除 DB 行
 ```
 
-### 7.2 阶段级进度（Span Tracker）
+### 阶段级进度（Span Tracker） {#_7-2-阶段级进度-span-tracker}
 
 `knowledge_span_tracker.go` + `internal/types/knowledge_span.go` 提供逐阶段进度树（前端时间线即由此渲染）：
 
 - 五个规范阶段：`StageDocReader / StageChunking / StageEmbedding / StageMultimodal / StagePostProcess`（`types.AllStages`）。
 - Span 状态：`pending / running / done / failed / skipped / cancelled`。`skipped` 用于主动跳过（如未开启多模态），`cancelled` 用于上游失败连带取消。
 - 每轮处理有独立 `Attempt`（`repo.NextAttempt`），根 Span `name="knowledge_processing"`、`Kind=SpanKindRoot`；阶段以 `beginStage / endStage / failStage / skipStage` 打点，输入输出记录在 `JSONMap`（如 `chunks_planned` / `chunks_written` / `total_text_chars`）。
-- 每次打点同时 `touchKnowledgeHeartbeat` 刷新心跳 —— Housekeeping 用它区分"慢但活着"与"真的卡死"。
+- 每次记录进度时，`touchKnowledgeHeartbeat` 同步刷新心跳，供 Housekeeping 区分仍在处理与已停止更新的任务。
 
-## 8. Housekeeping 自愈（knowledge_housekeeping.go）
+## Housekeeping 自愈（knowledge_housekeeping.go） {#_8-housekeeping-自愈-knowledge-housekeeping-go}
 
 后台每 **5 分钟**一轮（`WEKNORA_HOUSEKEEPING_ENABLED` 可关闭），修复因 worker 崩溃 / Redis 丢任务导致的僵尸状态：
 
@@ -456,20 +458,25 @@ stateDiagram-v2
 2. `filterByLastSpanActivity`：查 `knowledge_processing_spans` 的 `MAX(updated_at)` 心跳，心跳仍在阈值内的保留（仍在处理），无任何 span 的也判为卡死；
 3. `filterOutQueued`：通过 asynq TaskInspector 检查是否仍有排队任务，有则保留（只是在排队）。
 
-判定卡死的知识被更新为：
+判定卡死的知识逐行更新为 `parse_status = 'failed'`、`pending_subtasks_count = 0`，`error_message` 写明停在哪个阶段、最后一次进展时间，例如：
 
-```sql
-UPDATE knowledge SET parse_status = 'failed',
-    error_message = 'task stuck in processing > [threshold], recovered by housekeeping',
-    pending_subtasks_count = 0
-WHERE id IN (stuck_ids)
+```text
+task stuck in processing at docreader stage: no progress since 2026-09-22T09:37:54Z (> 2h10m0s), recovered by housekeeping
 ```
+
+同时关闭该知识最新一次 attempt 中仍处于 `pending`/`running` 的 span，错误码均为 `TASK_STALLED`，并补写 `duration_ms`：卡住的位置标为 `failed`，其余标为 `cancelled`。卡住的位置是正在运行的阶段 span；没有运行中的阶段时（`finalizing` 下后处理阶段已关闭），是最内层仍在运行的子 span，文案会带上它们的名字，如 `at postprocess stage (postprocess.summary)`。span 心跳查询失败时文案不写时间点。这样时间线上会显示卡在哪里，而不是一直转圈。
+
+前端在服务端判死之前会先给出提示：批量查询与 spans 接口为进行中的知识返回 `last_activity_at`；超过 20 分钟无进展时再返回服务端的判定 `stall_state`（与 Sweep A 的积压判定相同）。`stalled` 在列表、卡片和时间线上显示“疑似卡住”，时间线提供“停止解析”入口；`queued` 显示“排队中”，不提供停止入口；探测失败时没有判定，按普通解析中显示。安静期间轮询间隔放宽到 15 秒。
 
 阈值 `staleThreshold() = max(1h, DocumentProcessTimeout) + 10min`。
 
-**Sweep B —— 摘要卡死恢复**：`summary_status = 'processing' AND updated_at < 1 小时前` → 置 `failed`。
+**Sweep B —— 摘要卡死恢复**：`summary_status = 'processing' AND updated_at < 1 小时前` → 置 `failed`。`summary_status = 'pending'` 而解析已结束（`completed` / `failed` / `cancelled`）、超过 1 小时且队列中没有它的任务时，同样置为 `failed`，避免摘要任务提前放弃后前端一直显示"生成摘要中"。Sweep A 回收卡死文档、用户取消解析时，也会一并结束未完成的摘要状态（前者置 `failed`，后者置 `none`）。
 
-## 9. 删除清理链路（knowledge_delete.go）
+**Sweep C —— 删除卡死恢复**：`parse_status = 'deleting'` 且超过阈值、队列中也没有覆盖它的 `knowledge:list_delete` 任务时，置为 `failed` 并写明原因，文档重新出现在列表中，用户可以再次删除。探测队列失败时顺延到下一轮，Lite 模式没有排队任务，按实际情况直接恢复。
+
+**Wiki 队列兜底**：只因 Wiki 持久队列未消费而停在 `finalizing` 的文档，巡检会为对应知识库重新触发一次 Wiki 生成（同一知识库每个阈值周期最多一次）。Wiki 任务触发时若发现知识库已关闭 Wiki、没有合成模型或模型已删除，会清空尚未认领的 Wiki 操作并释放对应文档，使其正常结束 `finalizing`。合成模型存在但无法构建（例如地址被 SSRF 校验拒绝）时，Wiki 任务在最后一次重试也按同样方式释放文档。Wiki 操作最多保护文档 48 小时：超过 48 小时没有任何进展的文档按 Sweep A 回收为 `failed`，它的 Wiki 操作随之删除。
+
+## 删除清理链路（knowledge_delete.go） {#_9-删除清理链路-knowledge-delete-go}
 
 `DeleteKnowledge(ctx, id)` 的顺序经过精心设计（**先删行、后删文件**，失败可重试）：
 
@@ -485,7 +492,7 @@ WHERE id IN (stuck_ids)
 
 批量版 `DeleteKnowledgeList` 预加载各 KB 的 FileService、按 KB 分组图片 URL、按 embedding 模型分组删索引，避免 goroutine 内重复查询。
 
-## 10. FAQ 类知识导入（knowledge_faq.go / knowledge_faq_import.go）
+## FAQ 类知识导入（knowledge_faq.go / knowledge_faq_import.go） {#_10-faq-类知识导入-knowledge-faq-go-knowledge-faq-import-go}
 
 FAQ 知识库不走文档解析管线：每个 FAQ KB 只有**一个** Knowledge 实例（`ensureFAQKnowledge`），每条问答对是一个 `ChunkTypeFAQ` 的 Chunk，元数据存于 `Chunk.Metadata`：
 
@@ -510,9 +517,9 @@ type FAQChunkMetadata struct {
   - append 模式做四阶段校验（标准问冲突→整条失败；相似问/反例冲突→部分失败仅剔除冲突项；标准问已存在→合并并集）；
   - 进度写 Redis（`FAQImportProgress`：`pending/processing/completed/failed`、成功/失败/部分失败/跳过计数），失败条目导出为带 UTF-8 BOM 的 CSV 供下载。
 
-## 11. 知识克隆与移动（knowledge_clone_move.go）
+## 知识克隆与移动（knowledge_clone_move.go） {#_11-知识克隆与移动-knowledge-clone-move-go}
 
-### 11.1 克隆（CloneKnowledgeBase / CloneChunk）
+### 克隆（CloneKnowledgeBase / CloneChunk） {#_11-1-克隆-cloneknowledgebase-clonechunk}
 
 - KB 级克隆先复制 KB 配置，再按集合差（`AminusB`）增删 Knowledge，并行处理（删除批 10、克隆逐个）。
 - Chunk 级克隆（批量 100）复制 `Text/ParentText/Summary/ImageCaption/ImageOCR` 五类 chunk：
@@ -523,14 +530,14 @@ type FAQChunkMetadata struct {
 - FAQ KB 克隆走差量同步：`chunkRepo.FAQChunkDiff` 按 `content_hash` 算出增/删/匹配三组，匹配对仅同步状态（`IsEnabled/Flags/TagID/AnswerStrategy`）。
 - 进度写 Redis（`KBCloneProgress`）。
 
-### 11.2 移动（ProcessKnowledgeMove）
+### 移动（ProcessKnowledgeMove） {#_11-2-移动-processknowledgemove}
 
 门槛检查：源/目标 KB **类型必须相同**且 **EmbeddingModelID 必须相同**。两种模式：
 
 - `reuse_vectors`：要求 `sourceKB.SharesStoreWith(targetKB)`（同一向量存储实例），`CopyIndices` 复制索引 → 删源索引 → `MoveChunksByKnowledgeID` 改 chunk 归属 → 清 Tag 关联 → 更新 Knowledge 的 KB ID；
 - `reparse`：跨向量存储时使用。`cleanupKnowledgeResources`（删索引/chunks/图谱/回冲存储统计）→ Knowledge 重置为 `pending` 挂到目标 KB → 重新入队 `TypeDocumentProcess`（manual 类型走 `triggerManualProcessing`）。
 
-## 12. 端到端时序小结
+## 端到端时序小结 {#_12-端到端时序小结}
 
 一篇启用了多模态、问题生成与图谱的 PDF，完整旅程是：
 
@@ -539,3 +546,22 @@ type FAQChunkMetadata struct {
 3. 多模态 worker 逐图 OCR+Caption，生成 image_caption/image_ocr 子 chunk 并索引；全部完成后触发 post-process；
 4. 编排器计算 `expectedSubtasks`（1 摘要 + N/20 问题批 + M 图谱 + 0/1 Wiki）→ `SetFinalizing` → 扇出；每个子任务终态 `FinalizeSubtask` 递减，减到 0 → `completed`；
 5. 期间任一环节僵死，Housekeeping 5 分钟一轮按"updated_at + span 心跳 + 队列检查"三重判据回收为 `failed`，用户可 reparse（attempt+1）重来。
+
+## 实现参考
+
+各环节对应的源码位置：
+
+| 环节 | 源码位置 |
+|------|----------|
+| HTTP 入口 | `internal/handler/knowledge.go`、`internal/router/routes_knowledge.go` |
+| 创建与入队 | `internal/application/service/knowledge_create.go`、`knowledge_task_options.go` |
+| 文件存储 | `internal/application/service/file/`（`factory.go`、各后端实现） |
+| 解析基础设施 | `internal/infrastructure/docparser/`、`docreader/`（Python 服务） |
+| 主处理管线 | `internal/application/service/knowledge_process.go` |
+| 处理配置合并 | `internal/application/service/knowledge_process_config.go` |
+| 后处理 | `internal/application/service/knowledge_post_process.go`、`image_multimodal.go` |
+| 进度追踪 | `internal/application/service/knowledge_span_tracker.go`、`internal/types/knowledge_span.go` |
+| 自愈 | `internal/application/service/knowledge_housekeeping.go` |
+| 删除 | `internal/application/service/knowledge_delete.go` |
+| FAQ | `internal/application/service/knowledge_faq.go`、`knowledge_faq_import.go` |
+| 克隆/移动 | `internal/application/service/knowledge_clone_move.go` |

@@ -8,6 +8,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Tencent/WeKnora/internal/sandbox"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDeploymentCapabilityKeysMatchFrontend(t *testing.T) {
@@ -42,6 +45,31 @@ func TestBuildDeploymentCapabilitiesIncludesAllKeys(t *testing.T) {
 	}
 }
 
+func TestOverlayLiveDockerSandboxCapabilityIgnoresStartupSnapshot(t *testing.T) {
+	sandbox.ClearDockerBackendEnabledOverride()
+	t.Cleanup(sandbox.ClearDockerBackendEnabledOverride)
+	t.Setenv(sandbox.DockerBackendEnabledEnv, "")
+
+	snapshot := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{
+		Sandbox:       true,
+		SandboxDocker: true,
+	})
+	live := overlayLiveDockerSandboxCapability(snapshot)
+	docker := live.Capabilities["settings.sandbox.docker"]
+	if docker.Supported {
+		t.Fatal("live env off must hide docker even if the startup snapshot was on")
+	}
+	if docker.Reason != "docker_backend_disabled" {
+		t.Fatalf("reason = %q, want docker_backend_disabled", docker.Reason)
+	}
+
+	t.Setenv(sandbox.DockerBackendEnabledEnv, "true")
+	enabled := overlayLiveDockerSandboxCapability(snapshot)
+	if !enabled.Capabilities["settings.sandbox.docker"].Supported {
+		t.Fatal("live env true must expose docker")
+	}
+}
+
 func readFrontendDeploymentCapabilityKeys() ([]string, error) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -70,4 +98,33 @@ func readFrontendDeploymentCapabilityKeys() ([]string, error) {
 		keys = append(keys, line)
 	}
 	return keys, nil
+}
+
+func TestHostSandboxCapabilityFollowsAvailability(t *testing.T) {
+	data := BuildDeploymentCapabilities("lite", DeploymentFeatureAvailability{
+		Sandbox:     true,
+		SandboxHost: true,
+	})
+	require.True(t, data.Capabilities["settings.sandbox.host"].Supported)
+
+	off := BuildDeploymentCapabilities("lite", DeploymentFeatureAvailability{
+		Sandbox: true,
+	})
+	require.False(t, off.Capabilities["settings.sandbox.host"].Supported)
+	require.Equal(t, "platform_unsupported",
+		off.Capabilities["settings.sandbox.host"].Reason)
+}
+
+func TestRemoteSandboxCapabilityIsOffOnLiteDesktop(t *testing.T) {
+	on := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{Sandbox: true, SandboxRemote: true})
+	require.True(t, on.Capabilities["settings.sandbox.remote"].Supported)
+
+	off := BuildDeploymentCapabilities("lite", DeploymentFeatureAvailability{
+		Sandbox: true, SandboxRemote: false, SandboxHost: true,
+	})
+	require.False(t, off.Capabilities["settings.sandbox.remote"].Supported)
+	require.Equal(t, "not_supported_in_lite", off.Capabilities["settings.sandbox.remote"].Reason)
+
+	none := BuildDeploymentCapabilities("standard", DeploymentFeatureAvailability{})
+	require.Equal(t, "route_not_registered", none.Capabilities["settings.sandbox.remote"].Reason)
 }

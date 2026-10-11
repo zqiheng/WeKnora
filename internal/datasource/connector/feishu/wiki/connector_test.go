@@ -579,11 +579,14 @@ func TestConnectorResolveResourceAncestors(t *testing.T) {
 
 func TestFetchAll_DocxNode(t *testing.T) {
 	nodes := []core.WikiNode{{
-		NodeToken:    "nt1",
-		ObjToken:     "obj-docx-1",
-		ObjType:      "docx",
-		Title:        "My Document",
-		NodeEditTime: "1711468800",
+		NodeToken:      "nt1",
+		ObjToken:       "obj-docx-1",
+		ObjType:        "docx",
+		Title:          "My Document",
+		ObjCreateTime:  "1700000000",
+		ObjEditTime:    "1711000000",
+		NodeCreateTime: "1700000001",
+		NodeEditTime:   "1711468800",
 	}}
 	ts, cfg := fakeFeishu(nodes)
 	defer ts.Close()
@@ -616,6 +619,27 @@ func TestFetchAll_DocxNode(t *testing.T) {
 	}
 	if item.Metadata["channel"] != types.ChannelFeishu {
 		t.Errorf("Metadata[channel] = %q", item.Metadata["channel"])
+	}
+	// Source timestamps come from the document (obj_*), not the wiki node
+	// attributes, so a rename or move does not look like a content edit.
+	if got := item.UpdatedAt.Unix(); got != 1711000000 {
+		t.Errorf("UpdatedAt = %d, want obj_edit_time 1711000000", got)
+	}
+	if got := item.CreatedAt.Unix(); got != 1700000000 {
+		t.Errorf("CreatedAt = %d, want obj_create_time 1700000000", got)
+	}
+}
+
+func TestContentTimes_FallBackToNodeTimes(t *testing.T) {
+	n := core.WikiNode{NodeCreateTime: "1700000001", NodeEditTime: "1711468800"}
+	if got := contentEditTime(n).Unix(); got != 1711468800 {
+		t.Errorf("contentEditTime fallback = %d, want node_edit_time", got)
+	}
+	if got := contentCreateTime(n).Unix(); got != 1700000001 {
+		t.Errorf("contentCreateTime fallback = %d, want node_create_time", got)
+	}
+	if !contentEditTime(core.WikiNode{}).IsZero() || !contentCreateTime(core.WikiNode{}).IsZero() {
+		t.Errorf("missing times must stay zero, not epoch")
 	}
 }
 
@@ -1178,6 +1202,86 @@ func TestClientListWikiSpaces(t *testing.T) {
 	}
 	if spaces[0].SpaceID != "space1" {
 		t.Errorf("SpaceID = %q", spaces[0].SpaceID)
+	}
+}
+
+func TestClientWikiPaginationRejectsRepeatedPageToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		response func(int) interface{}
+		list     func(*core.Client) error
+	}{
+		{
+			name: "spaces",
+			path: "/open-apis/wiki/v2/spaces",
+			response: func(requests int) interface{} {
+				return core.WikiSpaceListResponse{
+					ApiResponse: core.ApiResponse{Code: 0},
+					Data: core.WikiSpaceListData{
+						Items:     []core.WikiSpace{{SpaceID: fmt.Sprintf("space-%d", requests)}},
+						HasMore:   true,
+						PageToken: "repeated-token",
+					},
+				}
+			},
+			list: func(client *core.Client) error {
+				_, err := client.ListWikiSpaces(context.Background())
+				return err
+			},
+		},
+		{
+			name: "nodes",
+			path: "/open-apis/wiki/v2/spaces/space1/nodes",
+			response: func(requests int) interface{} {
+				return core.WikiNodeListResponse{
+					ApiResponse: core.ApiResponse{Code: 0},
+					Data: core.WikiNodeListData{
+						Items:     []core.WikiNode{{NodeToken: fmt.Sprintf("node-%d", requests)}},
+						HasMore:   true,
+						PageToken: "repeated-token",
+					},
+				}
+			},
+			list: func(client *core.Client) error {
+				_, err := client.ListWikiNodes(context.Background(), "space1", "")
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			authPath := "/open-apis/auth/v3/tenant_access_token/internal"
+			mux.HandleFunc(authPath, func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, core.TokenResponse{
+					ApiResponse:       core.ApiResponse{Code: 0},
+					TenantAccessToken: "fake-token",
+					Expire:            7200,
+				})
+			})
+			requests := 0
+			mux.HandleFunc(tt.path, func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				if requests > 2 {
+					http.Error(w, "pagination should have stopped", http.StatusBadGateway)
+					return
+				}
+				writeJSON(w, tt.response(requests))
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			client := core.NewClient(&core.Config{AppID: "a", AppSecret: "b", BaseURL: ts.URL})
+			err := tt.list(client)
+			if err == nil || !strings.Contains(err.Error(), "repeated page token") {
+				t.Fatalf("expected repeated-page-token error, got %v", err)
+			}
+			if requests != 2 {
+				t.Fatalf("list requests = %d, want 2", requests)
+			}
+		})
 	}
 }
 

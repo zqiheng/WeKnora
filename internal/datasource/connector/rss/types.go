@@ -13,8 +13,8 @@
 //     Markdown. Feed-provided content (content:encoded / description) is used
 //     as a fallback.
 //   - Incremental: feed-level signals skip full-text article fetches when a feed
-//     entry is unchanged; content fingerprints detect feed-body changes. Article-
-//     only edits without feed updates may be missed until the feed entry changes.
+//     entry is unchanged; item fingerprints detect title, link and body changes.
+//     Article-only edits without feed updates may be missed until the feed entry changes.
 //     Deletions are NOT synced — feeds routinely drop old items.
 //
 // All outbound requests go through the SSRF-safe HTTP client so a malicious
@@ -29,7 +29,6 @@ import (
 	"maps"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -145,7 +144,9 @@ func (c *Config) parseHeaders() map[string]string {
 // rssCursor stores incremental sync state.
 //
 // FeedItems maps feedURL → itemID → fingerprint, where fingerprint is a
-// "h:<sha256-prefix>" hash of the final Markdown body that would be ingested.
+// "i:<sha256-prefix>" hash of the resolved title, link and Markdown body.
+// Legacy "h:" body-only fingerprints are upgraded in place when the body is
+// unchanged; only a changed body is re-ingested.
 // FeedSignals maps feedURL → itemID → feed-only signal used to skip full-text
 // article fetches when the feed entry itself has not changed.
 type rssCursor struct {
@@ -154,10 +155,28 @@ type rssCursor struct {
 	FeedSignals  map[string]map[string]string `json:"feed_signals,omitempty"`
 }
 
-// contentFingerprint hashes ingested Markdown for incremental change detection.
-func contentFingerprint(markdown string) string {
+const itemFingerprintPrefix = "i:"
+
+// isLegacyFingerprint reports a body-only "h:" cursor entry written before
+// item fingerprints existed.
+func isLegacyFingerprint(fp string) bool {
+	return fp != "" && !strings.HasPrefix(fp, itemFingerprintPrefix)
+}
+
+// legacyContentFingerprint is the body-only fingerprint older cursors stored.
+// It is kept only to recognise unchanged bodies when upgrading those cursors.
+func legacyContentFingerprint(markdown string) string {
 	sum := sha256.Sum256([]byte(markdown))
 	return "h:" + hex.EncodeToString(sum[:])[:16]
+}
+
+// itemFingerprint includes the document identity without timestamps, so date-only
+// feed changes still resolve articles without needlessly re-ingesting them.
+func itemFingerprint(title, link, markdown string) string {
+	// A string array cannot fail to marshal and preserves field boundaries.
+	data, _ := json.Marshal([3]string{title, link, markdown})
+	sum := sha256.Sum256(data)
+	return itemFingerprintPrefix + hex.EncodeToString(sum[:])[:16]
 }
 
 // feedSignalFingerprint hashes feed-visible fields so incremental sync can skip
@@ -218,32 +237,8 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// sanitizeFileName removes characters invalid in filenames and truncates to a
-// safe length at a UTF-8 rune boundary (mirrors the Yuque connector).
+// sanitizeFileName keeps feed titles on one line before applying shared limits.
 func sanitizeFileName(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "untitled"
-	}
-	replacer := strings.NewReplacer(
-		"/", "_", "\\", "_", ":", "_", "*", "_",
-		"?", "_", "\"", "_", "<", "_", ">", "_", "|", "_",
-		"\n", " ", "\r", " ", "\t", " ",
-	)
-	result := strings.TrimSpace(replacer.Replace(name))
-	if result == "" {
-		return "untitled"
-	}
-	const maxBytes = 200
-	if len(result) > maxBytes {
-		result = result[:maxBytes]
-		for len(result) > 0 {
-			r, size := utf8.DecodeLastRuneInString(result)
-			if r != utf8.RuneError || size != 1 {
-				break
-			}
-			result = result[:len(result)-1]
-		}
-	}
-	return result
+	name = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(name)
+	return datasource.SanitizeFileName(strings.TrimSpace(name))
 }

@@ -47,9 +47,10 @@
         </button>
       </header>
       <SkillFilesPanel
-        v-if="visible && configId && skillId"
+        v-if="visible && (catalogId || (configId && skillId))"
         :config-id="configId"
         :skill-id="skillId"
+        :catalog-id="catalogId"
         :drawer-width="drawerWidth"
       />
     </div>
@@ -66,8 +67,9 @@ const MIN_WIDTH = 480
 
 const props = defineProps<{
   visible: boolean
-  configId: string
-  skillId: string
+  configId?: string
+  skillId?: string
+  catalogId?: string
   skillName: string
 }>()
 
@@ -193,9 +195,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(7, 192, 95, 0.1);
+  background: color-mix(in srgb, var(--td-brand-color) 10%, transparent);
   color: var(--td-brand-color);
-  font-size: 16px;
+  font-size: var(--app-text-xl);
 }
 
 .skill-files-drawer__head-text {
@@ -204,7 +206,7 @@ onUnmounted(() => {
 }
 
 .skill-files-drawer__title {
-  font-size: 15px;
+  font-size: var(--app-text-lg);
   font-weight: 600;
   line-height: 1.4;
   color: var(--td-text-color-primary);
@@ -215,7 +217,7 @@ onUnmounted(() => {
 
 .skill-files-drawer__subtitle {
   margin-top: 2px;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.4;
   color: var(--td-text-color-secondary);
 }
@@ -229,7 +231,7 @@ onUnmounted(() => {
   justify-content: center;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
   color: var(--td-text-color-secondary);
   cursor: pointer;
@@ -295,7 +297,7 @@ onUnmounted(() => {
   border-radius: 1px;
   background: var(--td-component-border);
   opacity: 0.55;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  transition: opacity var(--app-motion-fast) ease, background var(--app-motion-fast) ease;
 }
 
 .skill-files-drawer-resize-handle:hover .skill-files-drawer-resize-line,

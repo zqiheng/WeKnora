@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -29,7 +30,7 @@ func prepareMessagesWithModelContext(
 		return messages, registry
 	}
 
-	ordered := orderedPipelineReferences(chatManage)
+	ordered := expandCitationSources(orderedPipelineReferences(chatManage))
 	knowledgeResults := make([]*types.SearchResult, 0, len(ordered))
 	knowledgeRows := make([]map[string]interface{}, 0, len(ordered))
 	webRows := make([]map[string]interface{}, 0)
@@ -60,12 +61,22 @@ func prepareMessagesWithModelContext(
 	registry.RegisterSearchResults(knowledgeResults)
 	var contextParts []string
 	if len(knowledgeRows) > 0 {
+		data := map[string]interface{}{
+			"display_type": "search_results",
+			"results":      knowledgeRows,
+		}
+		// The ranked filter chain (rerank → merge → FILTER_TOP_K) may have
+		// dropped candidates before this view was built. Carry the recorded
+		// pool and the number of knowledge passages actually rendered, so the
+		// model context can say the passages are a subset without restating
+		// the pool as a knowledge-base match count.
+		if truncation := chatManage.Truncation; truncation != nil {
+			data["retrieval_shown"] = len(knowledgeRows)
+			data["retrieval_candidates"] = truncation.Candidates
+		}
 		contextParts = append(contextParts, registry.ModelToolResult(&types.ToolResult{
 			Success: true,
-			Data: map[string]interface{}{
-				"display_type": "search_results",
-				"results":      knowledgeRows,
-			},
+			Data:    data,
 		}))
 	}
 	if len(webRows) > 0 {
@@ -79,7 +90,8 @@ func prepareMessagesWithModelContext(
 	}
 	modelContexts := strings.Join(contextParts, "\n")
 	if strings.TrimSpace(modelContexts) == "" {
-		return messages, registry
+		modelContexts = "Retrieved source bodies could not be verified. Do not cite or infer facts from " +
+			"unavailable retrieval evidence."
 	}
 
 	last := len(messages) - 1
@@ -92,6 +104,11 @@ func prepareMessagesWithModelContext(
 	}
 	if !replaced {
 		messages[last].Content = modelContexts + "\n\n" + messages[last].Content
+	}
+	if chatManage.ChatModelSupportsVision && len(chatManage.ContextImages) > 0 {
+		count := min(len(chatManage.ContextImageChunkIDs), len(chatManage.ContextImages))
+		ids := chatManage.ContextImageChunkIDs[:count]
+		messages[last].Content += registry.ImageSourcesNote(ids, len(chatManage.Images))
 	}
 	return messages, registry
 }
@@ -133,4 +150,17 @@ func firstPipelineTitle(result *types.SearchResult) string {
 		return result.KnowledgeTitle
 	}
 	return result.KnowledgeFilename
+}
+
+// reportModelContextLeaks logs any durable identifier that survived encoding
+// so the producing prompt or tool can be fixed; see modelcontext/leaks.go.
+func reportModelContextLeaks(
+	ctx context.Context, scope string, registry *modelcontext.Registry, messages []chat.Message,
+) {
+	leaks := registry.LeakedIdentifiers(messages)
+	if len(leaks) == 0 {
+		return
+	}
+	logger.Warnf(ctx, "[%s][ModelContext] %d message field(s) carry raw identifiers after encoding: %s",
+		scope, len(leaks), modelcontext.SummarizeLeaks(leaks))
 }

@@ -130,6 +130,10 @@ import {
   enhanceMarkdownContainer,
 } from '@/utils/mermaidShared'
 import {
+  getCatalogSkillFile,
+  listCatalogSkillFiles,
+} from '@/api/skill'
+import {
   getConfigSkillFile,
   listConfigSkillFiles,
   type ConfigSkillFileContent,
@@ -157,8 +161,9 @@ interface FrontmatterField {
 }
 
 const props = defineProps<{
-  configId: string
-  skillId: string
+  configId?: string
+  skillId?: string
+  catalogId?: string
   drawerWidth: number
 }>()
 
@@ -484,7 +489,7 @@ async function enhancePreview() {
 }
 
 async function selectFile(path: string) {
-  if (!props.configId || !props.skillId) return
+  if (!props.catalogId && (!props.configId || !props.skillId)) return
   selectedPath.value = path
   fileLoading.value = true
   fileError.value = ''
@@ -494,7 +499,9 @@ async function selectFile(path: string) {
   frontmatterFields.value = []
   markdownMode.value = 'preview'
   try {
-    const res = await getConfigSkillFile(props.configId, props.skillId, path)
+    const res = props.catalogId
+      ? await getCatalogSkillFile(props.catalogId, path)
+      : await getConfigSkillFile(props.configId || '', props.skillId || '', path)
     const data = res?.data
     file.value = data || null
     if (!data) {
@@ -519,7 +526,7 @@ async function copyContent() {
 }
 
 async function loadFiles() {
-  if (!props.configId || !props.skillId) return
+  if (!props.catalogId && (!props.configId || !props.skillId)) return
   listLoading.value = true
   listError.value = ''
   nodes.value = []
@@ -527,7 +534,9 @@ async function loadFiles() {
   file.value = null
   fileError.value = ''
   try {
-    const res = await listConfigSkillFiles(props.configId, props.skillId)
+    const res = props.catalogId
+      ? await listCatalogSkillFiles(props.catalogId)
+      : await listConfigSkillFiles(props.configId || '', props.skillId || '')
     const list = res?.data || []
     const tree = buildTree(list)
     nodes.value = tree
@@ -544,7 +553,7 @@ async function loadFiles() {
 }
 
 watch(
-  () => [props.configId, props.skillId],
+  () => [props.catalogId, props.configId, props.skillId],
   () => {
     void loadFiles()
   },
@@ -606,14 +615,14 @@ watch(
   margin-bottom: 2px;
   padding: 6px 12px;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-primary);
   cursor: pointer;
   text-align: left;
   user-select: none;
-  transition: background-color 0.2s ease, color 0.2s ease;
+  transition: background-color var(--app-motion-base) ease, color var(--app-motion-base) ease;
 
   &:hover {
     background-color: var(--td-bg-color-container-hover);
@@ -682,7 +691,7 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-secondary);
 }
 
@@ -691,9 +700,9 @@ watch(
   height: 24px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: transparent;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 24px;
   color: var(--td-text-color-secondary);
   cursor: pointer;
@@ -718,21 +727,21 @@ watch(
 
   &::-webkit-scrollbar-thumb {
     background: var(--td-bg-color-component-disabled);
-    border-radius: 4px;
+    border-radius: var(--app-radius-xs);
   }
 }
 
 .skill-files-panel__hint {
   margin: 24px 8px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
   color: var(--td-text-color-placeholder);
 }
 
 .skill-files-panel__warn {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-warning-color);
 }
 
@@ -740,7 +749,7 @@ watch(
   margin: 0 0 20px;
   padding: 8px 12px;
   border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   background: var(--td-bg-color-secondarycontainer);
 }
 
@@ -756,7 +765,7 @@ watch(
 
   dt {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     font-weight: 500;
     line-height: 1.5;
     color: var(--td-text-color-secondary);
@@ -765,15 +774,15 @@ watch(
   dd {
     margin: 0;
     min-width: 0;
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     line-height: 1.5;
     color: var(--td-text-color-primary);
     word-break: break-word;
     white-space: pre-wrap;
 
     &.is-code {
-      font-family: var(--td-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
-      font-size: 11px;
+      font-family: var(--td-font-family-mono);
+      font-size: var(--app-text-xs);
     }
   }
 }
@@ -788,8 +797,8 @@ watch(
   padding: 0;
   background: transparent;
   overflow: visible;
-  font-family: var(--td-font-family-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
-  font-size: 12px;
+  font-family: var(--td-font-family-mono);
+  font-size: var(--app-text-sm);
   line-height: 1.55;
   color: var(--td-text-color-primary);
   white-space: pre-wrap;
@@ -822,7 +831,7 @@ watch(
   background: var(--td-component-border);
   opacity: 0.55;
   pointer-events: none;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  transition: opacity var(--app-motion-fast) ease, background var(--app-motion-fast) ease;
 }
 
 .skill-files-split-handle:hover .skill-files-split-handle__line,

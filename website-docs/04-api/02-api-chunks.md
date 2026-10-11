@@ -1,8 +1,6 @@
 # API 参考：分块与标签
 
-分块（chunk）是检索的最小单元，标签用于给文档分类。两组接口都挂在知识库之下，与[知识库与知识](./02-api-knowledge.md)共用同一套权限规则：读为 Viewer+ 且对父 KB 有 read 权限（API key `retrieve`），写为「KB 创建者 OR Admin+」且有 write 权限（API key `ingest`），均受 API key 的 KB 白名单约束。
-
-路由注册：`internal/router/routes_knowledge.go` 的 `RegisterChunkRoutes`、`RegisterKnowledgeTagRoutes`、`RegisterChunkerDebugRoutes`。
+分块（chunk）是检索的最小单元，标签用于给文档分类。两组接口均属于知识库资源，与[知识库与知识](./02-api-knowledge.md)共用同一套权限规则：读为 Viewer+ 且对父 KB 有 read 权限（API key `retrieve`），写为「KB 创建者 OR Admin+」且有 write 权限（API key `ingest`），均受 API key 的 KB 白名单约束。
 
 通用约定（Base URL、认证、错误码、分页）见 [API 总览](./01-api-overview.md)。
 
@@ -30,7 +28,7 @@ curl "$BASE/api/v1/chunks/k-1?page=1" -H "Authorization: Bearer $TOKEN"
 
 用途：按 chunk ID 获取单个分块（无需 knowledge_id）。
 
-响应：200 `{"success":true,"data":{Chunk}}`
+响应：200 `{"success":true,"data":{Chunk}}`。`Chunk.source_locators` 是分块在原始文件中的位置，结构见 [API 概览](01-api-overview.md)中的 `source_locators` 说明。
 
 ```bash
 curl $BASE/api/v1/chunks/by-id/c-1 -H "Authorization: Bearer $TOKEN"
@@ -184,7 +182,9 @@ curl -X PUT $BASE/api/v1/knowledge-bases/kb-1/tags/t-1 -H "Authorization: Bearer
 
 ### DELETE /api/v1/knowledge-bases/:id/tags/:tag_id
 
-用途：删除标签。查询参数：`force`（bool，强制删除）、`content_only`（bool，仅删内容保留标签）。请求体（可选）：`{"exclude_ids":[int64]}`。
+用途：删除标签。查询参数：`force`（bool，强制删除被引用的标签）、`content_only`（bool，仅删除标签下的内容、保留标签）。请求体（可选）：`{"exclude_ids":[int64]}`，列出删除时保留的 FAQ 条目 seq_id。
+
+请求体格式不合法或 ID 非正整数返回 400；ID 不存在返回 404；ID 不属于当前知识库的 FAQ 条目返回 403。
 
 响应：200 `{"success":true}`
 
@@ -210,9 +210,15 @@ curl -X DELETE "$BASE/api/v1/knowledge-bases/kb-1/tags/t-1?force=true" -H "Autho
 | `chunking_config.enable_parent_child` | bool | 否 | 按父子分块试切，返回的是子块（与检索粒度一致） |
 | `chunking_config.parent_chunk_size` / `child_chunk_size` | int | 否 | 父/子块大小，缺省 4096 / 384 |
 
+样例文本中的内联 HTML `<table>` 会先转换为 Markdown 表格，与入库时的处理一致。
+
 响应：200 `{"success":true,"data":{"selected_tier","tier_chain","rejected","profile","chunks":[...],"stats":{count,avg_chars,min_chars,max_chars,stddev_chars,truncated_to}}}`；文本超长 413；分块超时（5s）504。
 
 ```bash
 curl -X POST $BASE/api/v1/chunker/preview -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"text":"# 标题\n正文...","chunking_config":{"chunk_size":512}}'
 ```
+
+## 实现参考
+
+路由注册：`internal/router/routes_knowledge.go` 的 `RegisterChunkRoutes`、`RegisterKnowledgeTagRoutes`、`RegisterChunkerDebugRoutes`。

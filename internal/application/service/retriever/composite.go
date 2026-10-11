@@ -2,6 +2,7 @@ package retriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -28,11 +29,20 @@ type CompositeRetrieveEngine struct {
 }
 
 // Retrieve performs retrieval operations by delegating to the appropriate engine
-// based on the retriever type specified in the parameters
+// based on the retriever type specified in the parameters.
+//
+// Error contract: a store-level failure is returned with no results, matching
+// the long-standing all-or-nothing policy. A result set that reports a partial
+// failure in RetrieveResult.Error is different — the hits it did return are
+// kept and the failure is returned *alongside* them, so callers can log the
+// gap without losing the evidence. Callers must therefore treat a non-nil
+// error with non-nil results as "incomplete", not as "no results".
 func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 	retrieveParams []types.RetrieveParams,
 ) ([]*types.RetrieveResult, error) {
-	return concurrentRetrieve(ctx, retrieveParams,
+	var partialMu sync.Mutex
+	var partialErrs []error
+	results, err := concurrentRetrieve(ctx, retrieveParams,
 		func(ctx context.Context, param types.RetrieveParams, results *[]*types.RetrieveResult, mu *sync.Mutex) error {
 			found := false
 			for _, engineInfo := range c.engineInfos {
@@ -43,6 +53,14 @@ func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 					result, err := engineInfo.retrieveEngine.Retrieve(ctx, param)
 					if err != nil {
 						return err
+					}
+					for _, one := range result {
+						if one == nil || one.Error == nil {
+							continue
+						}
+						partialMu.Lock()
+						partialErrs = append(partialErrs, one.Error)
+						partialMu.Unlock()
 					}
 					mu.Lock()
 					*results = append(*results, result...)
@@ -57,6 +75,14 @@ func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 			return nil
 		},
 	)
+	if err != nil {
+		// Engine-level failure: drop the results collected so far, unchanged.
+		return nil, err
+	}
+	if len(partialErrs) > 0 {
+		return results, fmt.Errorf("retrieve returned partial results: %w", errors.Join(partialErrs...))
+	}
+	return results, nil
 }
 
 // NewCompositeRetrieveEngine creates a new composite retrieve engine with the given parameters
@@ -311,4 +337,43 @@ func (c *CompositeRetrieveEngine) EstimateStorageSize(ctx context.Context,
 		logger.Errorf(ctx, "EstimateStorageSize failed: %v", err)
 	}
 	return sum.Load()
+}
+
+// ValidateKnowledgeIndexMove checks all stores before the first mutation.
+func (c *CompositeRetrieveEngine) ValidateKnowledgeIndexMove(ctx context.Context) error {
+	for _, info := range c.engineInfos {
+		if _, ok := info.retrieveEngine.(interfaces.KnowledgeIndexMover); !ok {
+			return fmt.Errorf("retriever %s does not support moving indices", info.retrieveEngine.EngineType())
+		}
+		if validator, ok := info.retrieveEngine.(interface{ ValidateKnowledgeIndexMove(context.Context) error }); ok {
+			if err := validator.ValidateKnowledgeIndexMove(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// MoveKnowledgeIndices updates each validated store with retry-safe operations.
+func (c *CompositeRetrieveEngine) MoveKnowledgeIndices(
+	ctx context.Context,
+	sourceKB, targetKB, knowledgeID string,
+	chunkIDs []string,
+	dimension int,
+	knowledgeType string,
+) error {
+	if err := c.ValidateKnowledgeIndexMove(ctx); err != nil {
+		return err
+	}
+	return c.concurrentExecWithError(ctx, func(ctx context.Context, info *engineInfo) error {
+		return info.retrieveEngine.(interfaces.KnowledgeIndexMover).MoveKnowledgeIndices(
+			ctx,
+			sourceKB,
+			targetKB,
+			knowledgeID,
+			chunkIDs,
+			dimension,
+			knowledgeType,
+		)
+	})
 }

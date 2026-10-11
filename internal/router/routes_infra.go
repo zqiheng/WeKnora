@@ -22,12 +22,17 @@ func RegisterModelRoutes(
 	{
 		// 获取模型厂商列表 — Viewer+
 		models.GET("/providers", g.Viewer(), handler.ListModelProviders)
+		// 解析模型的有效接入配置（协议 / 思考等级 / 上下文）— Viewer+
+		models.GET("/catalog/resolve", g.Viewer(), handler.ResolveModelCatalog)
+		models.POST("/catalog/resolve", g.Viewer(), handler.ResolveModelCatalog)
 		// 创建模型 — Admin+
 		models.POST("", g.Admin(), handler.CreateModel)
 		// 获取模型列表 — Viewer+
 		models.GET("", g.Viewer(), handler.ListModels)
 		// 调试已保存模型会发起真实上游调用并产生费用 — Admin+
 		models.POST("/:id/debug", g.Admin(), handler.DebugModel)
+		// 复制模型配置（含已存凭证）— Admin+
+		models.POST("/:id/copy", g.Admin(), handler.CopyModel)
 		// 获取单个模型 — Viewer+
 		models.GET("/:id", g.Viewer(), handler.GetModel)
 		// 更新模型 — Admin+；内置模型仍由服务层额外限定为 SystemAdmin。
@@ -68,6 +73,9 @@ func RegisterSandboxConfigRoutes(
 		configs.GET("/:id/skills/:skillId/files", g.Admin(), skills.ListFiles)
 		configs.GET("/:id/skills/:skillId/files/content", g.Admin(), skills.GetFile)
 		configs.POST("/:id/skills/:skillId/reinstall", g.Admin(), skills.Reinstall)
+		configs.GET("/:id/skills/:skillId/guidance", g.Admin(), skills.InstallGuidance)
+		configs.POST("/:id/skills/:skillId/guidance", g.Admin(), skills.SteerInstall)
+		configs.POST("/:id/skills/:skillId/stop", g.Admin(), skills.Stop)
 		configs.PATCH("/:id/skills/:skillId", g.Admin(), skills.Patch)
 		configs.DELETE("/:id/skills/:skillId", g.Admin(), skills.Delete)
 		configs.GET("/:id/skills/:skillId/install-events", g.Admin(), skills.InstallEvents)
@@ -159,6 +167,12 @@ func RegisterMCPServiceRoutes(
 		mcpServices.POST("/:id/test", g.Admin(), handler.TestMCPService)
 		// Get MCP service tools — Viewer+
 		mcpServices.GET("/:id/tools", g.Viewer(), handler.GetMCPServiceTools)
+		mcpServices.GET("/:id/metadata", g.Viewer(), handler.GetMCPMetadata)
+		// Refresh writes a principal-scoped OAuth snapshot for the caller
+		// (Viewer+), or a tenant-wide snapshot for static auth (Admin+ in the
+		// handler). GET /tools remains Viewer+ and does not persist.
+		mcpServices.POST("/:id/metadata/refresh", g.Viewer(), handler.RefreshMCPMetadata)
+		mcpServices.POST("/:id/usage-instructions/generate", g.Admin(), handler.GenerateMCPUsageInstructions)
 		// Get MCP service resources — Viewer+
 		mcpServices.GET("/:id/resources", g.Viewer(), handler.GetMCPServiceResources)
 		// Per-field credential subresource: secrets never travel via the main

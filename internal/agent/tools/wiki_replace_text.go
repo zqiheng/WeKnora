@@ -74,6 +74,11 @@ func (t *wikiReplaceTextTool) Execute(ctx context.Context, args json.RawMessage)
 	// Attribute every page write performed by this tool to the agent so
 	// revision history distinguishes agent edits from pipeline/user ones.
 	ctx = types.WithWikiEditSource(ctx, types.WikiEditSourceAgent)
+	// This tool edits by naming the exact text it removes, so a write that
+	// shortens the page is a deliberate removal — including deleting table
+	// rows, which is a normal request. The whole-page writer is deliberately
+	// NOT marked: there a shorter body is how truncation shows up.
+	ctx = types.WithWikiShrinkAllowed(ctx)
 	var params struct {
 		Slug       string    `json:"slug"`
 		OldText    string    `json:"old_text"`
@@ -111,15 +116,13 @@ func (t *wikiReplaceTextTool) Execute(ctx context.Context, args json.RawMessage)
 	existingPage.Content = strings.ReplaceAll(existingPage.Content, params.OldText, params.NewText)
 
 	if params.SourceRefs != nil {
-		if t.scopeEnforced {
-			resolvedRefs, scopeErr := resolveAuthorizedSourceRefs(ctx, t.searchTargets, *params.SourceRefs, t.knowledgeService)
-			if scopeErr != nil {
-				return &types.ToolResult{Success: false, Error: "Invalid source_refs: " + scopeErr.Error()}, nil
-			}
-			existingPage.SourceRefs = resolvedRefs
-		} else {
-			existingPage.SourceRefs = resolveSourceRefs(ctx, t.knowledgeService, *params.SourceRefs)
+		sourceDocs, scopeErr := resolveWikiSourceDocuments(
+			ctx, *params.SourceRefs, t.knowledgeService, t.searchTargets, t.scopeEnforced,
+		)
+		if scopeErr != nil {
+			return &types.ToolResult{Success: false, Error: "Invalid source_refs: " + scopeErr.Error()}, nil
 		}
+		existingPage.SourceRefs = wikiSourceRefs(sourceDocs)
 	}
 
 	_, err = t.wikiPageService.UpdatePage(ctx, existingPage)

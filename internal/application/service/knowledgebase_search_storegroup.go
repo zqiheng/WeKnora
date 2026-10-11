@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -61,6 +62,20 @@ type storeGroup struct {
 	// (knowledgebase_search_faq.go) updates this between calls to
 	// retrieveFromStores. Single-shot HybridSearch sets it once.
 	TopK int
+
+	// ImageKBIDs are the KBs of this group whose image vectors the search
+	// recalls: they opted in (KnowledgeBase.IsImageVectorEnabled) and the
+	// embedding model embeds images. When it is non-empty the group's
+	// document vector search is widened to find image rows, and
+	// VectorThreshold is the text threshold, which filterImageHits restores
+	// on text hits. Image hits of any other KB are dropped.
+	ImageKBIDs      map[string]struct{}
+	VectorThreshold float64
+}
+
+// imageRecall reports whether any KB of the group recalls image vectors.
+func (g *storeGroup) imageRecall() bool {
+	return len(g.ImageKBIDs) > 0
 }
 
 // resolveStoreGroups partitions kbs by (VectorStoreID, KB.TenantID),
@@ -183,55 +198,13 @@ func classifyFactoryError(
 	}
 }
 
-// authorizeKBAccess rejects multi-KB searches whose scope includes a KB
-// that the caller is not entitled to read. Same-tenant KBs always pass.
-// Foreign-tenant KBs (Organization-shared) must pass an explicit
-// tenant-scoped permission check via kbShareService.HasTenantKBPermission,
-// applying the 3-D cap (share role + caller's tenant-org role + tenant
-// Viewer cap) introduced in Plan 3 of #1303.
-//
-// Returning NotFound rather than Forbidden avoids leaking the existence
-// of unauthorized KB IDs that the caller could not otherwise observe.
-// Structured logs record the rejection with the offending kb_id (always
-// safe — KB IDs are UUIDs without sensitive content) and the requesting
-// tenant for audit.
+// authorizeKBAccess is a service wrapper around access.AuthorizeKBAccess
+// so HybridSearch and its tests keep calling through knowledgeBaseService.
 func (s *knowledgeBaseService) authorizeKBAccess(
 	ctx context.Context,
 	kbs []*types.KnowledgeBase,
-	requestTenantID uint64,
 ) error {
-	if len(kbs) == 0 {
-		return nil
-	}
-
-	callerTenantRole := types.TenantRoleFromContext(ctx)
-
-	for _, kb := range kbs {
-		if kb.TenantID == requestTenantID {
-			continue
-		}
-		hasPermission, permErr := s.kbShareService.HasTenantKBPermission(
-			ctx, kb.ID, requestTenantID, callerTenantRole, types.OrgRoleViewer)
-		if permErr != nil {
-			logger.ErrorWithFields(ctx, permErr, map[string]interface{}{
-				"caller_tenant_id": requestTenantID,
-				"kb_tenant_id":     kb.TenantID,
-				"kb_id":            kb.ID,
-				"reason":           "shared-KB permission lookup failed",
-			})
-			return apperrors.NewInternalServerError("failed to verify knowledge base access")
-		}
-		if !hasPermission {
-			logger.WarnWithFields(ctx, logger.Fields{
-				"caller_tenant_id": requestTenantID,
-				"kb_tenant_id":     kb.TenantID,
-				"kb_id":            kb.ID,
-				"reason":           "tenant lacks viewer permission for foreign-tenant KB",
-			}, "search scope rejected: unauthorized foreign-tenant KB")
-			return apperrors.NewNotFoundError("knowledge base not found")
-		}
-	}
-	return nil
+	return access.AuthorizeKBAccess(ctx, s.kbShareService, kbs)
 }
 
 // validateSameEmbeddingModel rejects multi-KB searches that span more than

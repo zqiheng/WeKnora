@@ -2,14 +2,15 @@ package session
 
 import (
 	stderrors "errors"
-	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/filetransport"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -43,6 +44,10 @@ func paramSessionID(c *gin.Context) string {
 // session; it does NOT return the storage URL (only names/sizes/mtimes), so
 // clients cannot reach around the download endpoint by reading a
 // provider:// path from the API response.
+//
+// Deleted artifacts are skipped but still consume their index: the index IS the
+// download address, so renumbering around a tombstone would point old links at
+// the wrong file.
 func (h *Handler) ListSessionArtifacts(c *gin.Context) {
 	ctx := c.Request.Context()
 	sessionID := secutils.SanitizeForLog(paramSessionID(c))
@@ -71,6 +76,9 @@ func (h *Handler) ListSessionArtifacts(c *gin.Context) {
 
 	items := make([]artifactListItem, 0, len(artifacts))
 	for i, a := range artifacts {
+		if a.Deleted() {
+			continue
+		}
 		items = append(items, artifactListItem{
 			Index:      i,
 			Handle:     artifactHandle(a),
@@ -123,6 +131,9 @@ func (h *Handler) ListMessageArtifacts(c *gin.Context) {
 
 	items := make([]artifactListItem, 0, len(msg.Artifacts))
 	for i, a := range msg.Artifacts {
+		if a.Deleted() {
+			continue
+		}
 		items = append(items, artifactListItem{
 			Index:      i,
 			Handle:     artifactHandle(a),
@@ -180,12 +191,16 @@ func (h *Handler) DownloadMessageArtifact(c *gin.Context) {
 		return
 	}
 	if index >= len(msg.Artifacts) {
-		c.Error(errors.NewNotFoundError("artifact index out of range"))
+		_ = c.Error(errors.NewNotFoundError("artifact index out of range"))
 		return
 	}
 	artifact := msg.Artifacts[index]
+	if artifact.Deleted() {
+		_ = c.Error(errors.NewNotFoundError("artifact deleted"))
+		return
+	}
 	if artifact.URL == "" {
-		c.Error(errors.NewNotFoundError("artifact storage path missing"))
+		_ = c.Error(errors.NewNotFoundError("artifact storage path missing"))
 		return
 	}
 
@@ -193,27 +208,40 @@ func (h *Handler) DownloadMessageArtifact(c *gin.Context) {
 		c.Error(errors.NewInternalServerError("file service unavailable"))
 		return
 	}
-	reader, err := h.fileService.GetFile(ctx, artifact.URL)
+	file, err := access.ResolveMessageArtifact(ctx, msg, index, h.agentShareService, h.resourceCatalog,
+		access.MessageKBShareAuthorizer{ShareGuard: h.kbShareService, KBs: h.knowledgebaseService})
+	if err != nil {
+		_ = c.Error(errors.NewNotFoundError("artifact not accessible"))
+		return
+	}
+	fileService, ctx, ok := h.resolveArtifactFileService(
+		ctx, file.OwnerTenantID, file.Path, file.StorageBackendID, "artifact download",
+	)
+	if !ok {
+		_ = c.Error(errors.NewNotFoundError("artifact storage unavailable"))
+		return
+	}
+	reader, err := fileService.GetFile(ctx, file.Path)
 	if err != nil {
 		logger.Warnf(ctx, "artifact download read failed: session=%s message=%s idx=%d err=%v",
 			sessionID, messageID, index, err)
-		c.Error(errors.NewNotFoundError("artifact blob missing"))
+		_ = c.Error(errors.NewNotFoundError("artifact blob missing"))
 		return
 	}
-	defer reader.Close()
-
-	// Force download semantics — artifacts are never rendered inline, matching
-	// the /files endpoint's active-content protection.
-	c.Header("Content-Type", mimeTypeFor(artifact.FileName))
-	c.Header("X-Content-Type-Options", "nosniff")
-	c.Header("Content-Disposition", buildAttachmentHeader(artifact.FileName))
-	if artifact.FileSize > 0 {
-		c.Header("Content-Length", strconv.FormatInt(artifact.FileSize, 10))
-	}
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, reader); err != nil {
-		logger.Warnf(ctx, "artifact download stream failed: session=%s message=%s idx=%d err=%v",
-			sessionID, messageID, index, err)
+	if err := filetransport.Serve(c.Writer, c.Request, reader, filetransport.Options{
+		Filename: artifact.FileName, Download: true, ContentType: mimeTypeFor(artifact.FileName),
+		Disposition:  buildAttachmentHeader(artifact.FileName),
+		Size:         artifact.FileSize,
+		CacheControl: "private, no-store",
+	}); err != nil {
+		logger.Warnf(
+			ctx,
+			"artifact download stream failed: session=%s message=%s idx=%d err=%v",
+			sessionID,
+			messageID,
+			index,
+			err,
+		)
 	}
 }
 

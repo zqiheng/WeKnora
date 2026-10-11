@@ -53,7 +53,23 @@ type fakeDockerEngine struct {
 	execStdout  string
 	execStderr  string
 	execExit    int
-	execErr     error
+	// execCreateHook observes each ExecCreate from whatever goroutine issued
+	// it, so a test can wait for a background exec (the terminal's marker
+	// refresh) without racing on the execOptions slice.
+	execCreateHook func(client.ExecCreateOptions)
+	// execInspectPID is what ExecInspect reports as the running process PID,
+	// used by the terminal's best-effort PID lookup.
+	execInspectPID int
+	// execInspectRunning is how many ExecInspect calls still report the exec
+	// as running before it reports the exit, which is how a daemon that has
+	// not recorded the exit code yet when the TTY stream hits EOF looks.
+	execInspectRunning atomic.Int32
+	execInspects       atomic.Int32
+	// execStarts records every ExecStart, so a test can prove the terminal's
+	// terminate exec was launched (detached) at close.
+	execStarts   []execStartCall
+	execStartErr error
+	execErr      error
 	// execNotRunningOnce makes the first ExecCreate fail the way the daemon
 	// does when the container has not reached State.Running yet.
 	execNotRunningOnce bool
@@ -63,6 +79,22 @@ type fakeDockerEngine struct {
 	// gives up on it. execStream is the stream handed to the last attach.
 	execStreamStalls bool
 	execStream       *stalledReader
+
+	// PTY (terminal) path. attachedOptions records every ExecAttach so a test
+	// can assert TTY was requested; execResizes records ExecResize calls.
+	// terminalStream, when set, is handed to a TTY attach verbatim (no stdcopy
+	// framing — that is exactly what a real TTY attach looks like).
+	attachedOptions []client.ExecAttachOptions
+	execResizes     []client.ExecResizeOptions
+	execResizeErr   error
+	terminalStream  io.Reader
+	// terminalBlocks makes a TTY attach return a stream that only ends when
+	// the hijacked connection is closed, mirroring a live shell.
+	terminalBlocks bool
+	// terminalConn, when set, is the hijacked connection of a TTY attach,
+	// both halves: a test holding the peer of a net.Pipe gets real deadline
+	// and back-pressure semantics.
+	terminalConn net.Conn
 
 	statResult map[string]container.PathStat
 	// statHook lets a test answer differently per call, which is how the
@@ -189,6 +221,9 @@ func (f *fakeDockerEngine) ExecCreate(
 	_ context.Context, _ string, options client.ExecCreateOptions,
 ) (client.ExecCreateResult, error) {
 	f.execOptions = append(f.execOptions, options)
+	if f.execCreateHook != nil {
+		f.execCreateHook(options)
+	}
 	if f.execNotRunningOnce && len(f.execOptions) == 1 {
 		return client.ExecCreateResult{}, cerrdefs.ErrConflict.WithMessage(
 			"container is not running")
@@ -200,8 +235,34 @@ func (f *fakeDockerEngine) ExecCreate(
 }
 
 func (f *fakeDockerEngine) ExecAttach(
-	_ context.Context, _ string, _ client.ExecAttachOptions,
+	_ context.Context, _ string, options client.ExecAttachOptions,
 ) (client.ExecAttachResult, error) {
+	f.attachedOptions = append(f.attachedOptions, options)
+	// A TTY attach is a raw byte stream: the daemon does not prepend the
+	// stdcopy 8-byte frame headers. Hand back exactly what the test supplied.
+	if options.TTY {
+		if f.terminalConn != nil {
+			return client.ExecAttachResult{HijackedResponse: client.HijackedResponse{
+				Conn:   f.terminalConn,
+				Reader: bufio.NewReader(f.terminalConn),
+			}}, nil
+		}
+		if f.terminalBlocks {
+			release := make(chan struct{})
+			return client.ExecAttachResult{HijackedResponse: client.HijackedResponse{
+				Conn:   &fakeHijackedConn{stdin: &f.execStdin, release: release},
+				Reader: bufio.NewReader(&terminalHijackReader{release: release, tail: f.terminalStream}),
+			}}, nil
+		}
+		stream := f.terminalStream
+		if stream == nil {
+			stream = strings.NewReader(f.execStdout)
+		}
+		return client.ExecAttachResult{HijackedResponse: client.HijackedResponse{
+			Conn:   &fakeHijackedConn{stdin: &f.execStdin},
+			Reader: bufio.NewReader(stream),
+		}}, nil
+	}
 	if f.execStreamStalls {
 		release := make(chan struct{})
 		f.execStream = &stalledReader{release: release}
@@ -217,6 +278,23 @@ func (f *fakeDockerEngine) ExecAttach(
 		Conn:   &fakeHijackedConn{stdin: &f.execStdin},
 		Reader: bufio.NewReader(&framed),
 	}}, nil
+}
+
+// terminalHijackReader is the raw-stream sibling of stalledReader: it blocks
+// until the paired hijacked connection closes, then yields tail (if any) before
+// EOF. That is how a real TTY attach ends when the client detaches.
+type terminalHijackReader struct {
+	release <-chan struct{}
+	once    sync.Once
+	tail    io.Reader
+}
+
+func (r *terminalHijackReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { <-r.release })
+	if r.tail == nil {
+		return 0, io.EOF
+	}
+	return r.tail.Read(p)
 }
 
 // stalledReader blocks until the hijacked connection it is paired with is
@@ -250,10 +328,34 @@ func (r *stalledReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+func (f *fakeDockerEngine) ExecStart(
+	_ context.Context, execID string, options client.ExecStartOptions,
+) (client.ExecStartResult, error) {
+	f.execStarts = append(f.execStarts, execStartCall{execID: execID, options: options})
+	return client.ExecStartResult{}, f.execStartErr
+}
+
+// execStartCall is one recorded ExecStart.
+type execStartCall struct {
+	execID  string
+	options client.ExecStartOptions
+}
+
 func (f *fakeDockerEngine) ExecInspect(
 	_ context.Context, _ string, _ client.ExecInspectOptions,
 ) (client.ExecInspectResult, error) {
-	return client.ExecInspectResult{ExitCode: f.execExit}, nil
+	f.execInspects.Add(1)
+	if f.execInspectRunning.Add(-1) >= 0 {
+		return client.ExecInspectResult{Running: true, PID: f.execInspectPID}, nil
+	}
+	return client.ExecInspectResult{ExitCode: f.execExit, PID: f.execInspectPID}, nil
+}
+
+func (f *fakeDockerEngine) ExecResize(
+	_ context.Context, _ string, options client.ExecResizeOptions,
+) (client.ExecResizeResult, error) {
+	f.execResizes = append(f.execResizes, options)
+	return client.ExecResizeResult{}, f.execResizeErr
 }
 
 func (f *fakeDockerEngine) ContainerStatPath(
@@ -456,8 +558,8 @@ func TestDockerClientCreateAppliesIsolationAndMetadata(t *testing.T) {
 	require.Len(t, engine.created, 1)
 	created := engine.created[0]
 	// PID 1 both keeps the container alive and prepares the activity marker so
-	// that root and the unprivileged sandbox user can each refresh it; the
-	// idle sweeper reads nothing else.
+	// that any account an exec may land on can refresh it; the idle sweeper
+	// reads nothing else.
 	require.Equal(t, dockerSandboxPID1User, created.Config.User,
 		"PID 1 must be root so the entrypoint can chmod the activity marker")
 	require.Equal(t, "/bin/sh", created.Config.Entrypoint[0])
@@ -602,7 +704,7 @@ func TestDockerClientConnectRestartsStoppedContainer(t *testing.T) {
 	}
 	docker := newTestDockerClient(t, engine)
 
-	handle, err := docker.Connect(context.Background(), "container-1")
+	handle, err := docker.Connect(context.Background(), RemoteConnectRequest{SandboxID: "container-1"})
 	require.NoError(t, err)
 	require.Equal(t, "container-1", handle.ID())
 	require.Equal(t, []string{"container-1"}, engine.started)
@@ -618,7 +720,7 @@ func TestDockerClientConnectUnpausesPausedContainer(t *testing.T) {
 	}
 	docker := newTestDockerClient(t, engine)
 
-	_, err := docker.Connect(context.Background(), "container-1")
+	_, err := docker.Connect(context.Background(), RemoteConnectRequest{SandboxID: "container-1"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"container-1"}, engine.unpaused)
 	require.Empty(t, engine.started)
@@ -628,7 +730,7 @@ func TestDockerClientConnectUnpausesPausedContainer(t *testing.T) {
 // session instead of failing every execution forever.
 func TestDockerClientConnectMissingContainerIsReplaceable(t *testing.T) {
 	docker := newTestDockerClient(t, newFakeDockerEngine())
-	_, err := docker.Connect(context.Background(), "container-gone")
+	_, err := docker.Connect(context.Background(), RemoteConnectRequest{SandboxID: "container-gone"})
 	require.Error(t, err)
 	require.True(t, CanReplaceRemoteBinding(err))
 }
@@ -862,10 +964,8 @@ func TestDockerClientExecResumesAStoppedContainerAndRetries(t *testing.T) {
 	require.Len(t, engine.execOptions, 2)
 }
 
-// The archive endpoint would apply this write as root and resolve symlinks on
-// the way, so a link planted under the writable workspace could redirect an
-// upload onto a file the sandbox account cannot touch. Writing through exec
-// puts the kernel back in charge.
+// Parent creation and writes share the explicit execution identity and pass
+// file content through stdin. This is not a symlink-containment test.
 func TestDockerClientWriteFileRunsAsSandboxUserOverExec(t *testing.T) {
 	engine := newFakeDockerEngine()
 	docker := newTestDockerClient(t, engine)
@@ -879,7 +979,7 @@ func TestDockerClientWriteFileRunsAsSandboxUserOverExec(t *testing.T) {
 
 	require.Contains(t, mkdir.Cmd, "mkdir")
 	require.Equal(t, DefaultSandboxExecUser, mkdir.User,
-		"mkdir as root would leave nested dirs unwritable by skill scripts")
+		"parent creation must use the same account as subsequent file and script operations")
 
 	require.Equal(t, DefaultSandboxExecUser, write.User)
 	require.True(t, write.AttachStdin)
@@ -937,6 +1037,12 @@ func TestDockerClientReadFileMapsFailures(t *testing.T) {
 			engine := newFakeDockerEngine()
 			engine.execExit = 1
 			engine.execStderr = tt.stderr
+			// The container is alive: these are genuine command failures,
+			// not the mid-op disappearance the vanish recheck covers.
+			engine.inspect["c"] = container.InspectResponse{
+				ID:    "c",
+				State: &container.State{Status: "running"},
+			}
 			docker := newTestDockerClient(t, engine)
 
 			_, err := docker.ReadFile(context.Background(), testHandle("c"),
@@ -963,10 +1069,9 @@ func TestDockerClientStatReportsSymlinkAsOther(t *testing.T) {
 		"a symlink must not be reported as the file it points at")
 }
 
-// Guards the property the symlink fix rests on. The archive endpoints ignored
-// the requested user and ran as root; if any file operation goes back to one,
-// this catches it without needing a daemon to prove the consequence.
-func TestDockerClientFileOperationsNeverRunAsRoot(t *testing.T) {
+// File operations retain the common exec path and explicitly select the
+// default identity. This does not assert symlink containment or non-root access.
+func TestDockerClientFileOperationsUseExplicitDefaultUser(t *testing.T) {
 	engine := newFakeDockerEngine()
 	engine.execStdout = "f\t3\t1786565482.0000000000\t/workspace/output/a.txt\n"
 	docker := newTestDockerClient(t, engine)
@@ -986,7 +1091,7 @@ func TestDockerClientFileOperationsNeverRunAsRoot(t *testing.T) {
 	require.NotEmpty(t, engine.execOptions)
 	for i, opts := range engine.execOptions {
 		require.Equal(t, DefaultSandboxExecUser, opts.User,
-			"exec %d (%v) must not run as root", i, opts.Cmd)
+			"exec %d (%v) must explicitly select the default sandbox account", i, opts.Cmd)
 	}
 }
 
@@ -1062,6 +1167,10 @@ func TestDockerClientCapabilities(t *testing.T) {
 		"the daemon has no TTL to refresh; reclamation is WeKnora's own sweep")
 	require.True(t, caps.SupportsSnapshots,
 		"docker commit is the skill-image snapshot; without this flag install is refused")
+	require.True(t, caps.SupportsTerminals,
+		"the PTY is a hijacked TTY exec; without this flag the terminal tab shows unsupported")
+	require.False(t, caps.SupportsDesktop,
+		"desktop relaying is not scheduled for the docker backend yet")
 	require.False(t, caps.SupportsVolumes)
 }
 
@@ -1203,4 +1312,56 @@ func TestDockerSessionCreateRequestDeletesIdleSandboxes(t *testing.T) {
 	require.Equal(t, DefaultDockerIdleTTL, request.Timeout.Value)
 	require.Equal(t, RemoteOnTimeoutKill, request.Timeout.Action,
 		"pausing a container keeps its memory on the host, so it reclaims nothing")
+}
+
+func TestDockerExecObservesBothOutputStreamsWithoutChangingResult(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.execStdout = "download started\n"
+	engine.execStderr = "download progress\n"
+	docker := newTestDockerClient(t, engine)
+	observed := map[string]string{}
+	result, err := docker.Exec(context.Background(), testHandle("container-1"), RemoteExecRequest{
+		Command: "echo", Timeout: time.Second,
+		OnOutput: func(stream string, p []byte) { observed[stream] += string(p) },
+	})
+	require.NoError(t, err)
+	require.Equal(t, result.Stdout, observed["stdout"])
+	require.Equal(t, result.Stderr, observed["stderr"])
+}
+
+// The idle sweeper can delete a container between ensureRunning's inspect
+// gate and the exec's completion (#3942 mechanism A): the exec dies with a
+// non-zero exit and an empty stderr. The filesystem ops must reclassify
+// that collision as NotFound so CanReplaceRemoteBinding lets the rebinding
+// self-heal run instead of surfacing InvalidRequest to the user.
+func TestFileOpAgainstVanishedContainerRebinds(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.execExit = 1
+	engine.execStderr = "" // the convicted signature: nothing on stderr
+	docker := newTestDockerClient(t, engine)
+	// The id never enters the inspect map: the fake's Engine 404s it,
+	// exactly like the daemon does after the sweeper's delete.
+	err := docker.MakeDir(context.Background(), testHandle("swept-away"), "/data/out")
+	require.True(t, IsRemoteNotFound(err), "got %+v", err)
+	require.True(t, CanReplaceRemoteBinding(err),
+		"a vanished container must be replaceable")
+	require.Contains(t, err.Error(), "exit=1",
+		"the exit code must survive in the message (#3942 diagnostic gap)")
+}
+
+// A genuine command failure with the container still alive keeps the
+// InvalidRequest classification — and with it the binding.
+func TestFileOpGenuineFailureKeepsBinding(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.execExit = 1
+	engine.execStderr = "mkdir: cannot create directory '/data/out': File exists"
+	engine.inspect["container-1"] = container.InspectResponse{
+		ID:    "container-1",
+		State: &container.State{Status: "running"},
+	}
+	docker := newTestDockerClient(t, engine)
+
+	err := docker.MakeDir(context.Background(), testHandle("container-1"), "/data/out")
+	require.True(t, IsRemoteInvalidRequest(err), "got %+v", err)
+	require.False(t, CanReplaceRemoteBinding(err))
 }

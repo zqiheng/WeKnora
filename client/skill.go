@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -53,9 +52,11 @@ func (c *Client) ListSkills(ctx context.Context, sandboxConfigID string) ([]Skil
 
 // InstallSandboxSkillFromSource installs a skill onto a sandbox config from a
 // public locator. Use "@owner/slug" (ClawHub), a github.com / gitlab.com /
-// skills.sh / skillhub URL, or a direct zip/SKILL.md URL. Bare "owner/slug"
-// is rejected as ambiguous. The call is accepted asynchronously; follow
-// progress on the skill ID.
+// skills.sh / skillhub URL, a ClawHub skills-sh catalog page
+// (https://clawhub.ai/skills-sh/owner/repo/slug), a skills-sh:owner/repo/slug
+// locator, or a direct zip/SKILL.md URL. Bare "owner/slug" is rejected as
+// ambiguous. The call is accepted asynchronously; follow progress on the
+// skill ID.
 func (c *Client) InstallSandboxSkillFromSource(
 	ctx context.Context, configID, source string,
 ) (string, error) {
@@ -99,14 +100,12 @@ func (c *Client) UploadSandboxSkill(
 	}
 
 	path := "/api/v1/sandbox-configs/" + url.PathEscape(configID) + "/skills"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body.Bytes()))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	c.applyAuthHeaders(ctx, req)
-	req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
-	req.ContentLength = int64(body.Len())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -144,6 +143,32 @@ func (c *Client) ReinstallSandboxSkill(
 		return "", err
 	}
 	return response.Data.SkillID, nil
+}
+
+// StopSandboxSkill aborts an in-flight install so the operator can retry or
+// uninstall. After a process restart the row may still say installing with no
+// live process; this rewrites it immediately instead of waiting for the
+// stuck-run reaper. Removal is not stopped.
+func (c *Client) StopSandboxSkill(
+	ctx context.Context, configID, skillID string,
+) (*SandboxSkill, error) {
+	if configID == "" {
+		return nil, fmt.Errorf("sandbox config ID is required")
+	}
+	if skillID == "" {
+		return nil, fmt.Errorf("skill ID is required")
+	}
+	path := "/api/v1/sandbox-configs/" + url.PathEscape(configID) +
+		"/skills/" + url.PathEscape(skillID) + "/stop"
+	resp, err := c.doRequest(ctx, http.MethodPost, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var response sandboxSkillResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+	return &response.Data, nil
 }
 
 // SandboxSkillEnv is one environment variable an installed skill declared. It

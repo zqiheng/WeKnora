@@ -1,32 +1,66 @@
 # 存储后端（Storage Backends）
 
-原始文件、解析出的图片、导出产物都要落在某个对象存储上。早期这只能靠环境变量配一套全局存储；migration `000068` 起改成**可注册多个存储实例**，空间选一个作默认，单个知识库还能绑定到指定实例。
+存储后端保存原始文件、解析图片和导出产物。一个空间可以注册多个实例，指定默认实例，并为知识库单独选择存储位置。
 
-典型用途：
+多实例存储适用于以下场景：
 
-- 不同团队/项目的资料落在不同的桶，便于分账与权限隔离；
-- 合规要求某类文档必须存在特定地域的桶里；
-- 从自建 MinIO 迁到云对象存储时，新库先用新后端，老库保持不动。
+- 将不同团队或项目的资料保存到独立存储桶，分别管理用量与权限；
+- 按数据存放要求选择存储桶所在地域；
+- 迁移到云对象存储时，让新知识库使用新后端，已有知识库继续访问原文件。
 
 <Screenshot
   src="/screenshots/settings-storage-backends.png"
   caption="存储后端设置：多实例列表、默认实例与连通性测试"
   hint="展示已注册的存储后端卡片（provider、状态、默认标记）与新建/编辑表单，含「测试连接」结果。" />
 
-## 怎么配
+## 注册和选择存储后端 {#怎么配}
 
-入口在「设置 → 存储」（`storage` 分区，需 Admin）：
+空间 Admin 可在「设置 → 存储」注册和管理实例：
 
-1. 新建后端，选 provider（`local` / `minio` / `cos` / `oss` / `s3` / `tos` / `obs` 等，与[文档入库流程](../02-architecture/03-document-pipeline.md)里的存储 provider 一致），填连接参数；
-2. **保存前点「测试」**：连通性测试会真实读写一次，配错的桶或过期的密钥能立刻发现，而不是等到上传文档时才报错；
-3. 需要的话把它设为空间默认（`PUT /storage-backends/:id/default`，同时写回 `tenants.default_storage_backend_id`）。新建知识库不指定实例时就用这个默认值；
-4. 单个知识库想用别的实例，在知识库编辑弹窗的「存储」页签里选——对应 `knowledge_bases.storage_backend_id`。
+1. 新建后端，选 provider（`local` / `minio` / `cos` / `tos` / `s3` / `oss` / `ks3` / `obs`，与[文档入库流程](../02-architecture/03-document-pipeline.md)里的存储 provider 一致），填连接参数（见下表）。可选列表受环境变量 `STORAGE_ALLOW_LIST` 限制，留空表示全部可选；
+2. **测试连接**：测试会实际读写存储，验证端点、存储桶和凭据；
+3. 将实例设为空间默认。新建知识库未指定实例时使用该默认值；
+4. 需要单独指定时，在知识库编辑弹窗的「存储」页签选择实例。
 
-## 接口
+知识库为空时可修改存储后端；已有文件时，界面会禁用选择并提示迁移。文件路径依赖入库时的后端，直接更换会影响原文件访问。需要更换时，应新建知识库并迁移内容。
+
+## 连接参数 {#连接参数}
+
+各 provider 共用一组配置字段，`access_key_id` / `secret_access_key` 加密保存，接口响应中掩码显示。
+
+| 名称 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `endpoint` | string | 空 | 服务地址。`minio`（`mode=remote`）、`tos`、`s3`、`oss`、`ks3`、`obs` 必填；`cos` 不需要。保存时做 SSRF 校验，内网地址需加入 `SSRF_WHITELIST` |
+| `region` | string | 空 | 地域。`cos`、`tos`、`s3`、`oss`、`ks3`、`obs` 必填 |
+| `access_key_id` / `secret_access_key` | string | 空 | 访问密钥；COS 对应 SecretId / SecretKey。`local` 与 `mode=docker` 的 MinIO 不需要 |
+| `bucket_name` | string | 空 | 存储桶，除 `local` 外必填 |
+| `path_prefix` | string | 空 | 对象键前缀，必须是相对路径，不能以 `/` 开头或包含 `..` |
+| `mode` | string | `remote` | 仅 MinIO：`docker` 使用部署自带的 MinIO（地址与密钥读取 `MINIO_ENDPOINT` 等环境变量），`remote` 连接外部 MinIO |
+| `use_ssl` | bool | false | MinIO、S3、OBS 是否使用 HTTPS |
+| `force_path_style` | bool | false | 仅 S3：使用 path-style 寻址，多数 S3 兼容服务需要开启 |
+| `app_id` | string | 空 | 仅 COS：腾讯云 AppID |
+| `temp_bucket_name` / `temp_region` | string | 空 | 仅 COS、TOS、OSS：临时文件使用的存储桶与地域；OSS 另需 `use_temp_bucket=true` 启用 |
+
+- **OBS**：endpoint 为域名时使用虚拟主机寻址（`<bucket>.<endpoint>`），华为云自 2023-12-30 起拒绝域名 endpoint 的 path-style 请求；endpoint 为 IP 时仍用 path-style。未配置代理域名时，文件 URL 形如 `<scheme>://<bucket>.<endpoint-host>/<key>`。
+- **传输超时**：S3、COS、KS3、OBS、OSS 的单次上传/下载不再受 30 秒整体超时限制，改为单次传输最长 30 分钟；建连、TLS 握手和等待响应头仍有各自的超时，对端失联时会较快失败。
+- **KS3 重定向**：跟随重定向时逐跳做 SSRF 校验，不再把请求签名转发到重定向目标主机。
+
+## 与向量存储的区别
+
+文件存储和向量存储分别管理原文件与检索索引：
+
+| | 存储后端（Storage Backend） | 向量存储（Vector Store） |
+| --- | --- | --- |
+| 存什么 | 原始文件、图片、导出产物 | 向量与检索索引 |
+| 配在哪 | 「设置 → 存储」 | 「设置 → 向量库」 |
+| 知识库字段 | `storage_backend_id` | `vector_store_id` |
+| 相关章节 | 本篇 | [检索引擎与向量存储](05-retrieval-engines.md) |
+
+## 接口参考 {#接口}
 
 | 方法 | 路径 | 权限 |
 | --- | --- | --- |
-| GET | `/storage-backends/types` | Viewer+，返回支持的 provider 及其字段定义 |
+| GET | `/storage-backends/types` | Viewer+，返回 `STORAGE_ALLOW_LIST` 允许的 provider 名称列表 |
 | GET | `/storage-backends`、`/storage-backends/:id` | Viewer+ |
 | POST | `/storage-backends` | Admin+ |
 | PUT / DELETE | `/storage-backends/:id` | Admin+ |
@@ -36,7 +70,7 @@
 
 API Key 需要 `manage_storage_backends` 能力或 full-access。
 
-## 数据模型与几个约束
+## 数据模型与兼容规则 {#数据模型与几个约束}
 
 `storage_backends` 表（`tenant_id` 隔离，软删除）关键字段：
 
@@ -45,21 +79,8 @@ API Key 需要 `manage_storage_backends` 能力或 full-access。
 | `name` | 空间内唯一（软删除下的部分唯一索引） |
 | `provider` | 存储类型 |
 | `config` | JSONB，含加密后的密钥 |
-| `source` | `user`（界面注册）/ 其它（系统生成） |
-| `status` | `active` / 停用 |
+| `source` | `user`（界面或 API 注册）/ `env`（由环境变量配置生成） |
+| `status` | `active` / `disabled` |
 | `legacy_alias` | 见下 |
 
-**`legacy_alias` 是为平滑升级准备的**：升级前用环境变量配置的那套全局存储，会被折算成一条别名记录，让老知识库的文件路径继续可解析，而不必做数据搬迁。同一空间同一 provider 只允许一条别名（部分唯一索引保证），因此它不会和你手工注册的实例混淆。
-
-**库里一有文件就不能再换**：知识库的存储选择在**空库时可改**，一旦有了文件，界面上的选择框就被禁用并提示需要迁移（`KBStorageSettings.vue` 按 `hasFiles` 判断）。原因是已入库文件的路径是按当时的后端生成的，直接改绑定会让旧文件失联。确实要换的话，新建知识库再迁移内容。
-
-## 与向量存储的区别
-
-两者容易混：
-
-| | 存储后端（Storage Backend） | 向量存储（Vector Store） |
-| --- | --- | --- |
-| 存什么 | 原始文件、图片、导出产物 | 向量与检索索引 |
-| 配在哪 | 「设置 → 存储」 | 「设置 → 向量库」 |
-| 知识库字段 | `storage_backend_id` | `vector_store_id` |
-| 相关章节 | 本篇 | [检索引擎与向量存储](05-retrieval-engines.md) |
+`legacy_alias` 用于兼容环境变量配置的历史存储。升级时创建别名记录，使已有文件路径继续可解析，无需搬迁数据。同一空间、同一 provider 只允许一条别名记录，手动注册的实例独立保存。

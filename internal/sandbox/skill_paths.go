@@ -18,6 +18,16 @@ const (
 	SkillsManifestPath = SkillsImageRoot + "/.manifest.json"
 )
 
+// HostSkillTargetID is the install target of Lite's local skills. It is a
+// reserved literal rather than a sandbox_configs row: the host backend has no
+// config to store, and a UUID can never collide with it.
+const HostSkillTargetID = "host"
+
+// IsHostSkillTarget reports whether configID names Lite's local skill target.
+func IsHostSkillTarget(configID string) bool {
+	return strings.TrimSpace(configID) == HostSkillTargetID
+}
+
 const skillShellArgv0 = "weknora-skill"
 
 // ErrInvalidSkillName is returned when a skill name would escape SkillsImageRoot
@@ -43,10 +53,19 @@ func IsValidSkillName(name string) bool {
 // is told to execute. The database id stays a row key and is not part of
 // the path.
 func SkillDirFor(skillName string) (string, error) {
+	return SkillDirUnder(SkillsImageRoot, skillName)
+}
+
+// SkillDirUnder joins one validated skill name under an absolute skills root.
+func SkillDirUnder(root, skillName string) (string, error) {
 	if !IsValidSkillName(skillName) {
 		return "", fmt.Errorf("%w %q", ErrInvalidSkillName, skillName)
 	}
-	return path.Join(SkillsImageRoot, skillName), nil
+	clean := path.Clean(strings.TrimSpace(root))
+	if clean == "." || clean == "/" || !path.IsAbs(clean) {
+		return "", fmt.Errorf("sandbox: invalid skills root %q", root)
+	}
+	return path.Join(clean, skillName), nil
 }
 
 // SkillRequirementsPath is where the installer agent writes what the skill
@@ -63,26 +82,123 @@ func SkillRequirementsPath(skillName string) string {
 	if err != nil {
 		return ""
 	}
-	return path.Join(dir, ".weknora", "requirements.json")
+	return SkillRequirementsPathIn(dir)
+}
+
+// SkillRequirementsPathIn is the declaration file inside one skill directory.
+func SkillRequirementsPathIn(skillDir string) string {
+	if strings.TrimSpace(skillDir) == "" {
+		return ""
+	}
+	return path.Join(skillDir, ".weknora", "requirements.json")
+}
+
+// RunnableWorkspaceScript reports whether scriptPath is a session-writable
+// file under /workspace that may be executed with an installed skill's
+// interpreter. /workspace/input is reserved for attachments and is excluded;
+// so are the workspace directory roots themselves.
+func RunnableWorkspaceScript(scriptPath string) (string, bool) {
+	clean := path.Clean(strings.TrimSpace(scriptPath))
+	if clean == SessionWorkspaceRoot || clean == SessionOutputRoot || clean == SessionInputRoot {
+		return "", false
+	}
+	if !strings.HasPrefix(clean, SessionWorkspaceRoot+"/") {
+		return "", false
+	}
+	if strings.HasPrefix(clean, SessionInputRoot+"/") {
+		return "", false
+	}
+	return clean, true
+}
+
+// ValidatedSessionOutputDir normalises a configured artifact directory and
+// reports whether it may be used.
+//
+// It is the single gate for every WEKNORA_SKILL_OUTPUT_DIR override, wherever
+// it comes from: the host environment the app reads at startup, or a tenant's
+// sandbox config. Without it the two disagreed — execution validated the path
+// and fell back to SessionOutputRoot, while the tools and the artifact
+// collector took the host value as-is. Keep this separate from shell working
+// directories: access to a sandbox path does not make it a delivery directory.
+//
+// SessionWorkspaceRoot itself is refused. An artifact directory equal to the
+// workspace root is not a delivery tree — it is the whole workspace, drafts
+// included — and callers that compare the two (artifact collection) read
+// that as "this backend collects nothing", silently dropping every artifact.
+func ValidatedSessionOutputDir(dir string) (string, bool) {
+	clean := path.Clean(strings.TrimSpace(dir))
+	if !strings.HasPrefix(clean, SessionWorkspaceRoot+"/") {
+		return "", false
+	}
+	return clean, true
+}
+
+// ValidatedImageSkillDir reports whether skillDir is exactly one installed
+// skill directory under SkillsImageRoot (for example /opt/weknora/tenant/skills/pdf).
+func ValidatedImageSkillDir(skillDir string) (string, bool) {
+	return ValidatedSkillDirUnder(SkillsImageRoot, skillDir)
+}
+
+// ValidatedSkillDirUnder reports whether skillDir is exactly one skill
+// directory directly under root.
+func ValidatedSkillDirUnder(root, skillDir string) (string, bool) {
+	clean := path.Clean(strings.TrimSpace(skillDir))
+	expected, err := SkillDirUnder(root, path.Base(clean))
+	if err != nil || expected != clean {
+		return "", false
+	}
+	return clean, true
+}
+
+// InterpreterSkillDir chooses the skill directory whose venv/node_modules
+// should run remote. Image-skill scripts always win from the path so a
+// mismatched SkillDir cannot redirect them. Workspace scripts require an
+// explicit, validated SkillDir.
+func InterpreterSkillDir(remotePath, skillDir string) (string, bool) {
+	if dir, ok := SkillDirForImageScript(remotePath); ok {
+		return dir, true
+	}
+	if _, ok := RunnableWorkspaceScript(remotePath); !ok {
+		return "", false
+	}
+	return ValidatedImageSkillDir(skillDir)
+}
+
+// SkillNameFromImagePath reports whether p sits at or under SkillsImageRoot.
+// The skills root itself returns ("", true). A skill directory or a file
+// inside one returns (skillName, true). Paths outside the image return
+// ("", false).
+func SkillNameFromImagePath(p string) (name string, inImage bool) {
+	clean := path.Clean(strings.TrimSpace(p))
+	root := path.Clean(SkillsImageRoot)
+	if clean == root {
+		return "", true
+	}
+	prefix := root + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return "", false
+	}
+	name = strings.SplitN(strings.TrimPrefix(clean, prefix), "/", 2)[0]
+	if !IsValidSkillName(name) {
+		return "", false
+	}
+	return name, true
 }
 
 // SkillDirForImageScript returns the owning skill directory for an image script.
 // It anchors on SkillsImageRoot so nested script layouts still use the venv that
 // was installed beside the skill, not a shallower scripts directory.
 func SkillDirForImageScript(scriptPath string) (string, bool) {
-	cleanRoot := path.Clean(SkillsImageRoot)
-	cleanScript := path.Clean(scriptPath)
-	prefix := cleanRoot + "/"
-	if !strings.HasPrefix(cleanScript, prefix) {
+	name, inImage := SkillNameFromImagePath(scriptPath)
+	if !inImage || name == "" {
 		return "", false
 	}
-
-	rest := strings.TrimPrefix(cleanScript, prefix)
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || !IsValidSkillName(parts[0]) {
+	clean := path.Clean(strings.TrimSpace(scriptPath))
+	dir, err := SkillDirFor(name)
+	if err != nil || clean == dir {
 		return "", false
 	}
-	return path.Join(cleanRoot, parts[0]), true
+	return dir, true
 }
 
 // SkillVenvPython is where a skill's own Python interpreter lives when the
@@ -111,11 +227,27 @@ func SkillInterpreterCommand(skillDir, scriptPath string) (string, []string) {
 			`if [ -x %s ]; then exec %s %s "$@"; else exec python3 %s "$@"; fi`,
 			ShellQuote(venvPython), ShellQuote(venvPython), script, script,
 		), skillShellArgv0}
-	case ".js", ".mjs":
+	case ".js", ".mjs", ".cjs":
 		return "node", []string{scriptPath}
 	case ".sh":
-		return "/bin/sh", []string{scriptPath}
+		// bash, with sh only as a fallback. Skill shell scripts carry a
+		// `#!/bin/bash` shebang almost exclusively, and /bin/sh is dash on
+		// Debian: an array literal, `function f()`, a C-style for loop and
+		// process substitution are all syntax errors there, so running these
+		// files with sh breaks scripts that are perfectly valid. The
+		// install-time check parses them with the same shell.
+		script := ShellQuote(scriptPath)
+		return "/bin/sh", []string{"-c", fmt.Sprintf(
+			`if command -v bash >/dev/null 2>&1; then exec bash %s "$@"; else exec sh %s "$@"; fi`,
+			script, script,
+		), skillShellArgv0}
 	default:
 		return "/bin/sh", []string{scriptPath}
 	}
+}
+
+// SkillCommandPath is shared by normal skill execution and installation verification.
+func SkillCommandPath(dir string) string {
+	return path.Join(dir, ".venv", "bin") + ":" +
+		path.Join(dir, "node_modules", ".bin") + ":" + path.Join(dir, ".weknora", "bin")
 }

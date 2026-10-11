@@ -1,12 +1,15 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/handler"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/gin-gonic/gin"
 )
 
@@ -40,6 +43,24 @@ func TestBuildDeploymentCapabilitiesHidesOrganizationsInLite(t *testing.T) {
 	}
 }
 
+func TestBuildDeploymentCapabilitiesHidesDockerUnlessOptedIn(t *testing.T) {
+	result := handler.BuildDeploymentCapabilities("standard", allDeploymentFeaturesAvailable())
+	docker := result.Capabilities["settings.sandbox.docker"]
+	if docker.Supported {
+		t.Fatal("docker sandbox must stay disabled until the deployment opts in")
+	}
+	if docker.Reason != "docker_backend_disabled" {
+		t.Fatalf("docker reason = %q, want docker_backend_disabled", docker.Reason)
+	}
+
+	available := allDeploymentFeaturesAvailable()
+	available.SandboxDocker = true
+	enabled := handler.BuildDeploymentCapabilities("standard", available)
+	if !enabled.Capabilities["settings.sandbox.docker"].Supported {
+		t.Fatal("SandboxDocker true must expose the docker backend")
+	}
+}
+
 func TestBuildDeploymentCapabilitiesReflectsMissingRoutes(t *testing.T) {
 	available := allDeploymentFeaturesAvailable()
 	available.Embed = false
@@ -60,6 +81,29 @@ func TestBuildDeploymentCapabilitiesReflectsMissingRoutes(t *testing.T) {
 		t.Fatal("an available route should remain supported")
 	}
 }
+
+func TestDeploymentCapabilitiesExposeHostWhenManagerPresent(t *testing.T) {
+	params := RouterParams{SandboxConfigHandler: &handler.SandboxConfigHandler{}}
+	hostOff := deploymentCapabilitiesFromRouter(params).Capabilities["settings.sandbox.host"]
+	if hostOff.Supported {
+		t.Fatal("host capability must stay off when no host manager is provided")
+	}
+
+	params.HostSandbox = service.HostSandboxManager{Manager: stubHostCapabilityManager{}}
+	hostOn := deploymentCapabilitiesFromRouter(params).Capabilities["settings.sandbox.host"]
+	if !hostOn.Supported {
+		t.Fatal("host capability must be on when the host manager is non-nil")
+	}
+}
+
+type stubHostCapabilityManager struct{}
+
+func (stubHostCapabilityManager) Execute(context.Context, *sandbox.ExecuteConfig) (*sandbox.ExecuteResult, error) {
+	return nil, nil
+}
+func (stubHostCapabilityManager) Cleanup(context.Context) error { return nil }
+func (stubHostCapabilityManager) GetSandbox() sandbox.Sandbox   { return nil }
+func (stubHostCapabilityManager) GetType() sandbox.SandboxType  { return sandbox.SandboxTypeHost }
 
 func TestGetDeploymentCapabilitiesHandlerReturnsSnapshot(t *testing.T) {
 	gin.SetMode(gin.TestMode)

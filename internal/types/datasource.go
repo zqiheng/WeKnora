@@ -38,6 +38,7 @@ const (
 	ConnectorTypeRSS         = "rss"
 	ConnectorTypeGitLab      = "gitlab"
 	ConnectorTypeIMA         = "ima"
+	ConnectorTypeSeafile     = "seafile"
 
 	// Sync modes
 	SyncModeIncremental = "incremental"
@@ -331,6 +332,9 @@ type FetchedItem struct {
 
 	// When last modified in external system
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// When created in external system. Zero when the source does not expose it.
+	CreatedAt time.Time `json:"created_at"`
 
 	// Additional metadata to preserve
 	Metadata map[string]string `json:"metadata"`

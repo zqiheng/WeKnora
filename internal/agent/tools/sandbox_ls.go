@@ -1,21 +1,20 @@
 // Package tools — list_sandbox_files.
 //
 // Read-only tool that lets the LLM enumerate files under a session's
-// sandbox artifact output directory. Without this tool, the LLM cannot
-// see files produced by prior skill invocations in the same session and
-// has to guess paths when chaining skills together.
+// inspectable sandbox directories. Without this tool, the LLM cannot
+// see files produced by prior skill invocations or staged chat
+// attachments and has to guess paths when chaining work together.
 //
 // Design notes:
 //   - Session-scoped: the sandbox path is resolved from the tool exec
 //     context (`ToolExecContext.SessionID`). The LLM cannot pass an
 //     arbitrary session ID.
-//   - Directory guardrail: `path` must resolve underneath the session's
-//     artifact output dir (`$WEKNORA_SKILL_OUTPUT_DIR`, default
-//     `/workspace/output`). This keeps the tool aligned with the
-//     directory ArtifactCollector already drains so anything the LLM
-//     lists is guaranteed to also become a downloadable artifact.
+//   - Paths are inside the current session's sandbox. Relative paths resolve
+//     from the workspace root. Omitting `path` lists the layout default
+//     (remote: `$WEKNORA_SKILL_OUTPUT_DIR` / `/workspace/output`; host: the
+//     workspace root).
 //   - Read-only: this tool never creates, modifies or deletes anything
-//     inside the sandbox. Writes still go through skill scripts.
+//     inside the sandbox. Model-authored files go through write_sandbox_file.
 //   - Graceful "no sandbox": if the session has never spawned a sandbox
 //     yet (chat-only turn, or sandbox was reaped), the tool returns an
 //     empty listing with a helpful message rather than an error, so the
@@ -26,12 +25,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -63,47 +60,19 @@ const (
 
 var listSandboxFilesTool = BaseTool{
 	name: ToolListSandboxFiles,
-	description: `List files produced by prior skill executions in the current session's sandbox.
-
-## Usage
-- Call this tool BEFORE invoking a follow-up skill that consumes a file
-  produced by an earlier skill in this session. Without this tool you are
-  guessing paths; with it you can see exactly what is available.
-- Also useful to confirm a skill actually produced the files it claims to
-  have generated (e.g. before telling the user "your report is ready").
-
-## When to Use
-- The user asks a follow-up question that references a file from a prior
-  turn ("summarize the report you generated", "improve the chart").
-- You are about to chain two skills where the second consumes an output
-  of the first.
-- You want to give the user a listing of everything the current session
-  has produced.
-
-## Path Rules
-- ` + "`path`" + ` is optional. When omitted, the tool lists the default artifact
-  output directory (` + "`$WEKNORA_SKILL_OUTPUT_DIR`" + `, typically ` + "`/workspace/output`" + `).
-- When provided, ` + "`path`" + ` MUST be underneath the artifact output directory.
-  Attempts to list arbitrary sandbox paths (e.g. ` + "`/etc`" + `, ` + "`/home`" + `) are
-  rejected.
-- Listing is recursive: sub-directories are traversed automatically and
-  only files are returned in the flat listing.
-
-## Returns
-- A list of entries with ` + "`path`" + ` (absolute, ready to pass to
-  ` + "`read_sandbox_file`" + `), ` + "`size`" + `, and ` + "`modified_at`" + ` timestamps.
-- When the session has never invoked a skill (no live sandbox yet), the
-  tool returns an empty listing with a clear "no sandbox" note — this is
-  not an error.`,
+	description: `List files inside the current session's sandbox when no shell executor is available.
+Relative paths resolve from /workspace; omitted path lists /workspace/output.
+Use known paths directly with read_file; list only to discover unknown files.
+Results are bounded by max_entries. An unprovisioned session returns an empty listing.`,
 	schema: utils.GenerateSchema[ListSandboxFilesInput](),
 }
 
 // ListSandboxFilesInput defines the input parameters for list_sandbox_files.
 type ListSandboxFilesInput struct {
 	// Path is the absolute path inside the sandbox to list. When empty
-	// the tool falls back to skills.ArtifactOutputDir(). Must be
-	// underneath the artifact output directory.
-	Path string `json:"path,omitempty" jsonschema:"Optional absolute sandbox path to list. Defaults to the session's artifact output directory. Must be underneath that directory."`
+	// the tool falls back to layoutDefaultListDir. Relative paths resolve
+	// from the workspace root.
+	Path string `json:"path,omitempty" jsonschema:"Optional absolute or /workspace-relative sandbox path to list. Defaults to /workspace/output on remote sandboxes, or the working directory on host."` //nolint:lll // one-line struct tag
 	// MaxEntries caps the listing size to protect the LLM context.
 	// Zero uses defaultListSandboxMaxEntries.
 	MaxEntries int `json:"max_entries,omitempty" jsonschema:"Optional cap on the number of entries returned. Defaults to 200, hard-capped at 500. Use a smaller value when you only need to check whether a specific file exists."`
@@ -113,6 +82,7 @@ type ListSandboxFilesInput struct {
 // agent as a read-only enumeration primitive.
 type ListSandboxFilesTool struct {
 	BaseTool
+	sessionBound
 	source SandboxFileSource
 }
 
@@ -121,10 +91,40 @@ type ListSandboxFilesTool struct {
 // the sandbox backend does not support per-session file inspection.
 func NewListSandboxFilesTool(source SandboxFileSource) *ListSandboxFilesTool {
 	return &ListSandboxFilesTool{
-		BaseTool: listSandboxFilesTool,
-		source:   source,
+		BaseTool: BaseTool{
+			name:   listSandboxFilesTool.name,
+			schema: listSandboxFilesTool.schema,
+		},
+		source: source,
 	}
 }
+
+// Description is built from the session sandbox layout so host paths never
+// hard-code /workspace.
+func (t *ListSandboxFilesTool) Description() string {
+	layout := t.boundLayout()
+	if layout.IsHost() {
+		return fmt.Sprintf(hostListSandboxFilesDescription, layoutRootOrGeneric(layout))
+	}
+	return rewriteRemoteWorkspaceCopy(listSandboxFilesTool.description, layout)
+}
+
+// Parameters rewrites workspace paths in the schema to match the session layout.
+func (t *ListSandboxFilesTool) Parameters() json.RawMessage {
+	return schemaForLayout(listSandboxFilesTool.schema, t.boundLayout())
+}
+
+func (t *ListSandboxFilesTool) boundLayout() sandbox.WorkspaceLayout {
+	if t == nil {
+		return sandbox.RemoteWorkspaceLayout()
+	}
+	return t.describeLayout(t.source)
+}
+
+const hostListSandboxFilesDescription = "List files in %s. Relative paths resolve from that folder; " +
+	"omitted path lists it.\n" +
+	"Use known paths directly with read_file; list only to discover unknown files.\n" +
+	"Results are bounded by max_entries."
 
 // Execute enumerates files under the requested path inside the current
 // session's sandbox.
@@ -156,25 +156,27 @@ func (t *ListSandboxFilesTool) Execute(ctx context.Context, args json.RawMessage
 		}, nil
 	}
 
+	layout, layoutErr := executeWorkspaceLayout(ctx, sessionID, t.source)
+	if layoutErr != nil {
+		return layoutErr, nil
+	}
+
 	// Resolve target directory. When the caller omits path we scan the
-	// same directory ArtifactCollector drains, guaranteeing everything
-	// the LLM sees will also be downloadable.
-	rootDir := skills.ArtifactOutputDir()
+	// layout's default listing (remote: artifact output; host: workspace).
 	targetDir := strings.TrimSpace(input.Path)
 	if targetDir == "" {
-		targetDir = rootDir
+		targetDir = layoutDefaultListDir(layout)
 	} else {
-		clean := path.Clean(targetDir)
-		if !isUnderRoot(clean, rootDir) {
-			return &types.ToolResult{
-				Success: false,
-				Error: fmt.Sprintf(
-					"path %q is outside the artifact output directory %q; the LLM can only list files under the artifact output directory",
-					input.Path, rootDir,
-				),
-			}, nil
-		}
-		targetDir = clean
+		targetDir = resolveIn(layout, targetDir)
+	}
+	rootDir, ok := inspectRoot(layout, targetDir)
+	if !ok {
+		// Report the resolved directory, not input.Path: an omitted path
+		// would otherwise be refused as `path ""`.
+		return &types.ToolResult{
+			Success: false,
+			Error:   inspectScopeErrorIn(layout, targetDir),
+		}, nil
 	}
 
 	maxEntries := input.MaxEntries
@@ -213,7 +215,7 @@ func (t *ListSandboxFilesTool) Execute(ctx context.Context, args json.RawMessage
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("=== Sandbox listing: %s ===\n\n", targetDir))
 	if len(entries) == 0 {
-		b.WriteString("No files found. Either no skill has produced output in this session yet, or the sandbox has been reaped.\n")
+		b.WriteString("No files found under this path. Either nothing has been written here yet, or the sandbox has been reaped.\n")
 	} else {
 		b.WriteString(fmt.Sprintf("Found %d file(s)", len(entries)))
 		if truncated {
@@ -283,9 +285,11 @@ func resolveSessionID(ctx context.Context) string {
 }
 
 // isUnderRoot reports whether clean sits at or underneath root. Both
-// arguments must already be cleaned. This guardrail keeps the LLM from
-// listing paths outside the artifact output directory: even if a rogue
-// prompt asks for `/etc/passwd`, the tool refuses.
+// arguments must already be cleaned. On a remote sandbox this labels roots
+// and protects the attachment tree; shell_exec can still reach the same
+// files. On a host layout, write scope and work_dir clamping use this as
+// the tool-layer boundary — the OS sandbox PathGuard remains the real
+// privilege check, including symlink follow.
 func isUnderRoot(clean, root string) bool {
 	if clean == root {
 		return true

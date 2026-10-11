@@ -104,6 +104,12 @@
             {{ $t(`settings.sandbox.backendDescriptions.${backend}`) }}
           </p>
         </t-form-item>
+        <t-alert v-if="backend === 'docker' && !dockerBackendEnabled" theme="warning" class="compact-alert"
+          :message="$t('settings.sandbox.dockerDisabledAlert')">
+          <template #description>
+            <p>{{ $t('settings.sandbox.dockerDisabledHint') }}</p>
+          </template>
+        </t-alert>
         <t-form-item :label="$t('settings.sandbox.configName')" :status="nameError ? 'error' : undefined"
           :tips="nameError || undefined">
           <t-input v-model="name" :placeholder="$t('settings.sandbox.configNamePlaceholder')" />
@@ -237,6 +243,18 @@
           <t-input v-model="docker.tls_cert_path" placeholder="/etc/weknora/docker-certs"
             :disabled="retargetFrozen" @input="onFieldInput('tls_cert_path')" />
         </t-form-item>
+        <t-alert theme="warning" class="compact-alert" :message="$t('settings.sandbox.dockerHostRisk')" />
+        <div class="private-endpoint-row">
+          <div>
+            <p class="private-endpoint-row__title">{{ $t('settings.sandbox.allowPrivateEndpoints') }}</p>
+            <p class="section-help">{{ $t('settings.sandbox.allowPrivateEndpointsHint') }}</p>
+          </div>
+          <t-switch
+            v-model="allowPrivateEndpoints"
+            :disabled="retargetFrozen"
+            @change="invalidateConnection"
+          />
+        </div>
       </section>
 
       <section v-if="currentStepKey === 'template'" class="setting-drawer__section">
@@ -272,6 +290,22 @@
               <p class="template-row__hint">{{ $t('settings.sandbox.createStandardTemplateHint') }}</p>
             </div>
           </div>
+          <div v-if="canCreateDesktop" class="template-row template-row--offer">
+            <div class="template-row__main">
+              <div class="template-row__head">
+                <span class="template-row__title">{{ $t('settings.sandbox.weknoraDesktopTemplate') }}</span>
+                <t-tag theme="warning" variant="outline" size="small">
+                  {{ $t('settings.sandbox.desktopTemplateTag') }}
+                </t-tag>
+                <span class="template-row__spacer" />
+                <t-button theme="primary" variant="outline" size="small" :loading="templatesLoading"
+                  @click="createDesktopTemplate">
+                  {{ $t('settings.sandbox.createDesktopTemplate') }}
+                </t-button>
+              </div>
+              <p class="template-row__hint">{{ $t('settings.sandbox.createDesktopTemplateHint') }}</p>
+            </div>
+          </div>
           <div
             v-for="item in templates"
             :key="item.id"
@@ -298,6 +332,9 @@
                 <t-tag v-if="item.standard" theme="primary" variant="outline" size="small">
                   {{ $t('settings.sandbox.recommendedTag') }}
                 </t-tag>
+                <t-tag v-else-if="item.desktop" theme="warning" variant="outline" size="small">
+                  {{ $t('settings.sandbox.desktopTemplateTag') }}
+                </t-tag>
                 <span class="template-row__spacer" />
                 <t-tag :theme="templateStatusTheme(item)" variant="outline" size="small">
                   {{ templateStatusLabel(item) }}
@@ -305,8 +342,10 @@
                 <span v-if="canRebuildTemplate(item)" class="template-row__rebuild" @click.stop>
                   <t-popconfirm
                     theme="warning"
-                    :content="$t('settings.sandbox.replaceStandardTemplateConfirm')"
-                    @confirm="replaceStandardTemplate"
+                    :content="item.desktop
+                      ? $t('settings.sandbox.replaceDesktopTemplateConfirm')
+                      : $t('settings.sandbox.replaceStandardTemplateConfirm')"
+                    @confirm="replaceFirstPartyTemplate(item)"
                   >
                     <t-button variant="text" size="small" :loading="templatesLoading">
                       {{ $t('settings.sandbox.replaceStandardTemplate') }}
@@ -326,7 +365,7 @@
               <p v-else-if="templateFailureReason(item)" class="template-row__hint template-row__hint--error">
                 {{ templateFailureReason(item) }}
               </p>
-              <p v-else-if="isTemplatePending(item) && item.standard" class="template-row__hint">
+              <p v-else-if="isTemplatePending(item) && (item.standard || item.desktop)" class="template-row__hint">
                 {{ $t('settings.sandbox.templateBuildingHint') }}
               </p>
             </div>
@@ -347,75 +386,325 @@
 
       <section v-if="currentStepKey === 'runtime'" class="setting-drawer__section">
         <h4 class="setting-drawer__section-title">{{ $t('settings.sandbox.sectionRuntime') }}</h4>
-        <!--
-          Three unlabelled numbers side by side shared one footnote, so nobody
-          could tell which limit they were raising. Each gets its own row and
-          its own sentence naming what it bounds and what happens on expiry.
-        -->
         <div class="runtime-fields">
-          <template v-if="isRemoteBackend">
-            <t-form-item :label="$t('settings.sandbox.httpTimeout')">
-              <t-input-number v-if="backend === 'cube'" v-model="cube.http_timeout_sec" :min="0" theme="column"
-                placeholder="30" />
-              <t-input-number v-else v-model="e2b.http_timeout_sec" :min="0" theme="column" placeholder="30" />
-            </t-form-item>
-            <p class="section-help section-help--field">{{ $t('settings.sandbox.httpTimeoutHelp') }}</p>
-            <t-form-item :label="$t('settings.sandbox.sandboxTtl')">
-              <t-input-number v-if="backend === 'cube'" v-model="cube.cube_sandbox_ttl_seconds" :min="0"
-                theme="column" placeholder="1800" />
-              <t-input-number v-else v-model="e2b.e2b_sandbox_ttl_seconds" :min="0" theme="column"
-                placeholder="300" />
-            </t-form-item>
-            <p class="section-help section-help--field">{{ $t('settings.sandbox.sandboxTtlHelp') }}</p>
-          </template>
           <!--
-            Docker has no provider-side timeout at all: an abandoned container
-            keeps its memory and CPU share on the daemon host until WeKnora
-            reclaims it, so the idle TTL and the resource caps are the only
-            things bounding what one workspace can hold.
+            Each number keeps its own label and its own sentence — the reason
+            these were one-per-row originally was that three unlabelled numbers
+            side by side shared a single footnote. Moving the sentence into the
+            field's own tips keeps that fixed while halving the height.
           -->
-          <template v-if="backend === 'docker'">
-            <t-form-item :label="$t('settings.sandbox.dockerIdleTtl')">
-              <t-input-number v-model="docker.idle_ttl_seconds" :min="0" theme="column" placeholder="1800" />
+          <div class="form-grid form-grid--two">
+            <template v-if="isRemoteBackend">
+              <t-form-item :label="$t('settings.sandbox.httpTimeout')"
+                :tips="$t('settings.sandbox.httpTimeoutHelp')">
+                <t-input-number v-if="backend === 'cube'" v-model="cube.http_timeout_sec" :min="0"
+                  theme="column" placeholder="30" />
+                <t-input-number v-else v-model="e2b.http_timeout_sec" :min="0" theme="column"
+                  placeholder="30" />
+              </t-form-item>
+              <t-form-item :label="$t('settings.sandbox.sandboxTtl')"
+                :tips="$t('settings.sandbox.sandboxTtlHelp')">
+                <t-input-number v-if="backend === 'cube'" v-model="cube.cube_sandbox_ttl_seconds"
+                  :min="0" theme="column" placeholder="1800" />
+                <t-input-number v-else v-model="e2b.e2b_sandbox_ttl_seconds" :min="0"
+                  theme="column" placeholder="300" />
+              </t-form-item>
+            </template>
+            <!--
+              Docker has no provider-side timeout at all: an abandoned container
+              keeps its memory and CPU share on the daemon host until WeKnora
+              reclaims it, so the idle TTL and the resource caps are the only
+              things bounding what one workspace can hold.
+            -->
+            <template v-if="backend === 'docker'">
+              <t-form-item :label="$t('settings.sandbox.dockerIdleTtl')"
+                :tips="$t('settings.sandbox.dockerIdleTtlHelp')">
+                <t-input-number v-model="docker.idle_ttl_seconds" :min="0" theme="column"
+                  placeholder="1800" />
+              </t-form-item>
+              <t-form-item :label="$t('settings.sandbox.dockerCpuLimit')"
+                :tips="$t('settings.sandbox.dockerCpuLimitHelp')">
+                <t-input-number v-model="docker.cpu_limit" :min="0" :step="0.5" theme="column"
+                  placeholder="2" />
+              </t-form-item>
+              <t-form-item :label="$t('settings.sandbox.dockerMemoryLimit')"
+                :tips="$t('settings.sandbox.dockerMemoryLimitHelp')">
+                <t-input-number v-model="docker.memory_limit_mb" :min="0" theme="column"
+                  placeholder="2048" />
+              </t-form-item>
+              <t-form-item :label="$t('settings.sandbox.dockerPidsLimit')"
+                :tips="$t('settings.sandbox.dockerPidsLimitHelp')">
+                <t-input-number v-model="docker.pids_limit" :min="0" theme="column"
+                  placeholder="512" />
+              </t-form-item>
+            </template>
+            <t-form-item :label="$t('settings.sandbox.defaultTimeout')"
+              :tips="$t('settings.sandbox.defaultTimeoutHelp')">
+              <t-input-number v-model="defaultTimeoutSec" :min="0" theme="column" placeholder="60" />
             </t-form-item>
-            <p class="section-help section-help--field">{{ $t('settings.sandbox.dockerIdleTtlHelp') }}</p>
-            <t-form-item :label="$t('settings.sandbox.dockerCpuLimit')">
-              <t-input-number v-model="docker.cpu_limit" :min="0" :step="0.5" theme="column" placeholder="2" />
+            <t-form-item :label="$t('settings.sandbox.terminalIdleDisconnect')"
+              :tips="$t('settings.sandbox.terminalIdleDisconnectHelp')">
+              <t-input-number v-model="terminalIdleDisconnectSec" :min="0" :max="86400"
+                theme="column" placeholder="900" />
             </t-form-item>
-            <t-form-item :label="$t('settings.sandbox.dockerMemoryLimit')">
-              <t-input-number v-model="docker.memory_limit_mb" :min="0" theme="column" placeholder="2048" />
-            </t-form-item>
-            <t-form-item :label="$t('settings.sandbox.dockerPidsLimit')">
-              <t-input-number v-model="docker.pids_limit" :min="0" theme="column" placeholder="512" />
-            </t-form-item>
-            <p class="section-help section-help--field">{{ $t('settings.sandbox.dockerResourceHelp') }}</p>
-            <t-form-item :label="$t('settings.sandbox.dockerNetworkMode')">
-              <t-select v-model="docker.network_mode" :placeholder="$t('settings.sandbox.dockerNetworkBridge')"
-                clearable>
-                <t-option value="bridge" :label="$t('settings.sandbox.dockerNetworkBridge')" />
-                <t-option value="none" :label="$t('settings.sandbox.dockerNetworkNone')" />
-              </t-select>
-            </t-form-item>
-            <p class="section-help section-help--field">{{ $t('settings.sandbox.dockerNetworkModeHelp') }}</p>
-          </template>
-          <t-form-item :label="$t('settings.sandbox.defaultTimeout')">
-            <t-input-number v-model="defaultTimeoutSec" :min="0" theme="column" placeholder="60" />
+          </div>
+        </div>
+      </section>
+
+      <section v-if="currentStepKey === 'runtime'" class="setting-drawer__section">
+        <h4 class="setting-drawer__section-title">{{ $t('settings.sandbox.sectionNetwork') }}</h4>
+        <p class="section-help section-help--under-title">
+          {{ $t('settings.sandbox.networkHint') }}
+        </p>
+
+        <template v-if="backend !== 'docker'">
+          <t-form-item :label="$t('settings.sandbox.egressDefault')"
+            :tips="$t('settings.sandbox.egressPrecedence')">
+            <t-radio-group v-model="denyEgressByDefault">
+              <t-radio :value="false">{{ $t('settings.sandbox.egressAllowAll') }}</t-radio>
+              <t-radio :value="true">{{ $t('settings.sandbox.egressDenyAll') }}</t-radio>
+            </t-radio-group>
           </t-form-item>
-          <p class="section-help section-help--field">{{ $t('settings.sandbox.defaultTimeoutHelp') }}</p>
+        </template>
+
+        <template v-if="backend === 'docker'">
+          <t-form-item :label="$t('settings.sandbox.dockerNetworkMode')"
+            :tips="$t('settings.sandbox.dockerNetworkModeHelp')">
+            <t-select v-model="docker.network_mode"
+              :placeholder="$t('settings.sandbox.dockerNetworkBridge')" clearable>
+              <t-option value="bridge" :label="$t('settings.sandbox.dockerNetworkBridge')" />
+              <t-option value="none" :label="$t('settings.sandbox.dockerNetworkNone')" />
+            </t-select>
+          </t-form-item>
+        </template>
+
+        <template v-else>
+          <div class="net-list">
+            <div class="section-title-row">
+              <span class="net-list__title">{{ $t('settings.sandbox.allowOut') }}</span>
+              <t-button variant="text" size="small" @click="allowOutRows.push('')">
+                <template #icon><t-icon name="add" /></template>
+                {{ $t('settings.sandbox.addTarget') }}
+              </t-button>
+            </div>
+            <div v-for="(_, index) in allowOutRows" :key="`allow-${index}`" class="net-row">
+              <t-input v-model="allowOutRows[index]"
+                :placeholder="$t('settings.sandbox.allowOutPlaceholder')" />
+              <t-button variant="text" shape="square" size="small"
+                :aria-label="$t('common.delete')" @click="allowOutRows.splice(index, 1)">
+                <t-icon name="close" />
+              </t-button>
+            </div>
+            <p class="section-help">{{ $t('settings.sandbox.allowOutHelp') }}</p>
+            <t-alert v-if="domainAllowNeedsDenyAll" theme="warning" class="compact-alert"
+              :message="$t('settings.sandbox.domainAllowNeedsDenyAll')" />
+          </div>
+
+          <div class="net-list">
+            <div class="section-title-row">
+              <span class="net-list__title">{{ $t('settings.sandbox.denyOut') }}</span>
+              <t-button variant="text" size="small" @click="denyOutRows.push('')">
+                <template #icon><t-icon name="add" /></template>
+                {{ $t('settings.sandbox.addTarget') }}
+              </t-button>
+            </div>
+            <div v-for="(_, index) in denyOutRows" :key="`deny-${index}`" class="net-row">
+              <t-input v-model="denyOutRows[index]"
+                :placeholder="$t('settings.sandbox.denyOutPlaceholder')" />
+              <t-button variant="text" shape="square" size="small"
+                :aria-label="$t('common.delete')" @click="denyOutRows.splice(index, 1)">
+                <t-icon name="close" />
+              </t-button>
+            </div>
+            <p class="section-help">{{ $t('settings.sandbox.denyOutHelp') }}</p>
+          </div>
+        </template>
+
+        <div v-if="backend === 'cube'" class="net-list">
+          <div class="section-title-row">
+            <span class="net-list__title">{{ $t('settings.sandbox.cubeL7Rules') }}</span>
+            <t-button variant="text" size="small" @click="addCubeRule()">
+              <template #icon><t-icon name="add" /></template>
+              {{ $t('settings.sandbox.addRule') }}
+            </t-button>
+          </div>
+          <p class="section-help">{{ $t('settings.sandbox.cubeL7RulesHelp') }}</p>
+          <div v-for="(rule, index) in cubeRules" :key="rule.key"
+            class="net-rule net-rule--collapsible" :class="{ 'is-open': rule.expanded }">
+            <div class="net-rule__bar">
+              <button
+                type="button"
+                class="net-rule__toggle"
+                :aria-expanded="rule.expanded"
+                :aria-label="rule.expanded
+                  ? $t('settings.sandbox.collapseRule')
+                  : $t('settings.sandbox.expandRule')"
+                @click="rule.expanded = !rule.expanded"
+              >
+                <t-icon :name="rule.expanded ? 'chevron-down' : 'chevron-right'" size="14px" />
+                <span class="net-rule__name" :class="{ 'is-empty': !rule.name.trim() }">
+                  {{ rule.name.trim() || $t('settings.sandbox.ruleUntitled') }}
+                </span>
+              </button>
+              <div class="net-rule__actions">
+                <button type="button" class="net-rule__move"
+                  :disabled="index === 0"
+                  :aria-label="$t('settings.sandbox.moveRuleUp')"
+                  @click="moveCubeRule(index, -1)">
+                  <t-icon name="chevron-up" size="14px" />
+                </button>
+                <button type="button" class="net-rule__move"
+                  :disabled="index === cubeRules.length - 1"
+                  :aria-label="$t('settings.sandbox.moveRuleDown')"
+                  @click="moveCubeRule(index, 1)">
+                  <t-icon name="chevron-down" size="14px" />
+                </button>
+                <button type="button" class="net-rule__remove"
+                  :aria-label="$t('common.delete')" @click="cubeRules.splice(index, 1)">
+                  <t-icon name="close" size="14px" />
+                </button>
+              </div>
+            </div>
+            <div v-if="rule.expanded" class="net-rule__body">
+              <div class="form-grid form-grid--two">
+                <t-form-item :label="$t('settings.sandbox.ruleName')">
+                  <t-input v-model="rule.name" placeholder="allow-payment-api" />
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleScheme')">
+                  <t-select v-model="rule.scheme" clearable>
+                    <t-option value="https" label="https" />
+                    <t-option value="http" label="http" />
+                  </t-select>
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleSni')">
+                  <t-input v-model="rule.sni" placeholder="api.example.com" />
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleHost')">
+                  <t-input v-model="rule.host" placeholder="api.example.com" />
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleMethods')">
+                  <t-input v-model="rule.methodsText" placeholder="POST, GET" />
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.rulePath')">
+                  <t-input v-model="rule.path" placeholder="/v1/*" />
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleAction')">
+                  <t-select v-model="rule.deny">
+                    <t-option :value="false" :label="$t('settings.sandbox.ruleAllow')" />
+                    <t-option :value="true" :label="$t('settings.sandbox.ruleDeny')" />
+                  </t-select>
+                </t-form-item>
+                <t-form-item :label="$t('settings.sandbox.ruleAudit')">
+                  <t-select v-model="rule.audit" clearable>
+                    <t-option value="metadata" label="metadata" />
+                    <t-option value="full" label="full" />
+                    <t-option value="none" label="none" />
+                  </t-select>
+                </t-form-item>
+              </div>
+              <div v-if="!rule.deny" class="net-inject">
+                <span class="net-list__title">{{ $t('settings.sandbox.ruleInject') }}</span>
+                <div v-for="(inject, injectIndex) in rule.inject" :key="`inject-${injectIndex}`"
+                  class="net-row net-row--triple">
+                  <t-input v-model="inject.header" :placeholder="$t('settings.sandbox.headerName')" />
+                  <t-input v-model="inject.secret" type="password"
+                    :placeholder="isStoredNetworkSecretRecoverable(
+                      inject,
+                      inject.originalRuleName,
+                      inject.originalHeader,
+                      rule.name,
+                      inject.header,
+                    )
+                      ? $t('settings.sandbox.secretKeepHint')
+                      : $t('settings.sandbox.headerValue')" />
+                  <t-input v-model="inject.format" placeholder="Bearer ${SECRET}" />
+                  <t-button variant="text" shape="square" size="small"
+                    :aria-label="$t('common.delete')" @click="rule.inject.splice(injectIndex, 1)">
+                    <t-icon name="close" />
+                  </t-button>
+                </div>
+                <t-button variant="text" size="small"
+                  @click="rule.inject.push({ header: '', secret: '', format: '' })">
+                  <template #icon><t-icon name="add" /></template>
+                  {{ $t('settings.sandbox.addHeader') }}
+                </t-button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="backend === 'e2b'" class="net-list">
+          <div class="section-title-row">
+            <span class="net-list__title">{{ $t('settings.sandbox.e2bHostRules') }}</span>
+            <t-button variant="text" size="small" @click="addE2BHostRule()">
+              <template #icon><t-icon name="add" /></template>
+              {{ $t('settings.sandbox.addRule') }}
+            </t-button>
+          </div>
+          <p class="section-help">{{ $t('settings.sandbox.e2bHostRulesHelp') }}</p>
+          <div v-for="(rule, index) in e2bHostRules" :key="`e2b-rule-${index}`"
+            class="net-rule net-rule--collapsible" :class="{ 'is-open': rule.expanded }">
+            <div class="net-rule__bar">
+              <button
+                type="button"
+                class="net-rule__toggle"
+                :aria-expanded="rule.expanded"
+                :aria-label="rule.expanded
+                  ? $t('settings.sandbox.collapseRule')
+                  : $t('settings.sandbox.expandRule')"
+                @click="rule.expanded = !rule.expanded"
+              >
+                <t-icon :name="rule.expanded ? 'chevron-down' : 'chevron-right'" size="14px" />
+                <span class="net-rule__name" :class="{ 'is-empty': !rule.host.trim() }">
+                  {{ rule.host.trim() || $t('settings.sandbox.ruleUntitled') }}
+                </span>
+              </button>
+              <button type="button" class="net-rule__remove"
+                :aria-label="$t('common.delete')" @click="e2bHostRules.splice(index, 1)">
+                <t-icon name="close" size="14px" />
+              </button>
+            </div>
+            <div v-if="rule.expanded" class="net-rule__body">
+              <t-form-item :label="$t('settings.sandbox.ruleHost')">
+                <t-input v-model="rule.host" placeholder="api.example.com" />
+              </t-form-item>
+              <div v-for="(header, headerIndex) in rule.headers" :key="`header-${headerIndex}`"
+                class="net-row net-row--double">
+                <t-input v-model="header.name" :placeholder="$t('settings.sandbox.headerName')" />
+                <t-input v-model="header.value" type="password"
+                  :placeholder="isStoredNetworkSecretRecoverable(
+                    header,
+                    header.originalHost,
+                    header.originalName,
+                    rule.host,
+                    header.name,
+                  )
+                    ? $t('settings.sandbox.secretKeepHint')
+                    : $t('settings.sandbox.headerValue')" />
+                <t-button variant="text" shape="square" size="small"
+                  :aria-label="$t('common.delete')" @click="rule.headers.splice(headerIndex, 1)">
+                  <t-icon name="close" />
+                </t-button>
+              </div>
+              <t-button variant="text" size="small"
+                @click="rule.headers.push({ name: '', value: '' })">
+                <template #icon><t-icon name="add" /></template>
+                {{ $t('settings.sandbox.addHeader') }}
+              </t-button>
+            </div>
+          </div>
         </div>
       </section>
 
       <section v-if="currentStepKey === 'runtime'" class="setting-drawer__section">
         <div class="section-title-row">
-          <div>
-            <h4 class="setting-drawer__section-title">{{ $t('settings.sandbox.sectionEnvironment') }}</h4>
-            <p class="section-help section-help--under-title">{{ $t('settings.sandbox.envVarsHint') }}</p>
-          </div>
+          <h4 class="setting-drawer__section-title">{{ $t('settings.sandbox.sectionEnvironment') }}</h4>
           <t-button variant="text" size="small" @click="envRows.push({ key: '', value: '' })">
             <template #icon><t-icon name="add" /></template>
             {{ $t('settings.sandbox.addRow') }}
           </t-button>
         </div>
+        <p class="section-help section-help--under-title">{{ $t('settings.sandbox.envVarsHint') }}</p>
         <div v-if="envRows.length" class="env-rows">
           <div v-for="(row, index) in envRows" :key="index" class="env-row">
             <t-input v-model="row.key" :placeholder="$t('settings.sandbox.envKey')" class="env-key" />
@@ -430,24 +719,16 @@
         </div>
         <div v-else class="env-empty">{{ $t('settings.sandbox.noEnvVars') }}</div>
       </section>
-    </t-form>
 
-    <!--
-      Skills need an image to be installed into, so this step is only reachable
-      once the config exists. During creation the wizard walks into it right
-      after the first successful save; the hint covers the one case left, a
-      config whose save was refused.
-    -->
-    <template v-if="currentStepKey === 'skills'">
-      <SandboxSkillsPanel
-        v-if="effectiveRecord"
-        :record="effectiveRecord"
-        @updated="onSkillsConfigUpdated"
-        @skills-changed="emit('skillsChanged')"
-        @in-flight-change="inFlightFromPanel = $event"
-      />
-      <p v-else class="skills-locked">{{ $t('settings.sandbox.stepSkillsLocked') }}</p>
-    </template>
+      <section v-if="currentStepKey === 'runtime'" class="setting-drawer__section">
+        <h4 class="setting-drawer__section-title">{{ $t('settings.sandbox.skillRollout') }}</h4>
+        <p class="section-help section-help--under-title">{{ $t('settings.sandbox.skillRolloutHint') }}</p>
+        <t-radio-group v-model="skillRollout" class="skill-rollout-group">
+          <t-radio value="next_turn">{{ $t('settings.sandbox.skillRolloutNextTurn') }}</t-radio>
+          <t-radio value="new_session">{{ $t('settings.sandbox.skillRolloutNewSession') }}</t-radio>
+        </t-radio-group>
+      </section>
+    </t-form>
 
     <div
       v-if="checkResult && showCheckResult"
@@ -472,9 +753,6 @@
       <p v-if="pendingCheckNames.length" class="check-result__hint">
         {{ $t('settings.sandbox.checkPendingHint', { names: pendingCheckNames.join('、') }) }}
       </p>
-      <t-alert v-if="checkResult.capabilities && checkResult.capabilities.supports_volumes === false" theme="warning"
-        class="compact-alert"
-        :message="$t('settings.sandbox.noVolumeSupport')" />
     </div>
 
   </SettingDrawer>
@@ -486,13 +764,15 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
 import SandboxBackendBadge from '@/components/settings/SandboxBackendBadge.vue'
-import SandboxSkillsPanel from '@/components/SandboxSkillsPanel.vue'
+import { useDeploymentCapabilitiesStore } from '@/stores/deploymentCapabilities'
+import { docsUrl } from '@/utils/docsUrl'
 import {
   checkSandboxConfig,
   createSandboxConfig,
   parseSandboxConflict,
   updateSandboxConfigById,
   querySandboxTemplates,
+  listConfigSkills,
   type SandboxCheckItem,
   type SandboxCheckResult,
   type SandboxConfig,
@@ -501,30 +781,30 @@ import {
   type SandboxCubeConfig,
   type SandboxE2BConfig,
   type SandboxDockerConfig,
+  type SandboxNetworkPolicy,
   type SandboxTemplate,
   isNamedSandboxBackend,
   NAMED_SANDBOX_BACKEND_TYPES,
 } from '@/api/system'
 
-type SandboxStepKey = 'connection' | 'template' | 'runtime' | 'skills'
+type SandboxStepKey = 'connection' | 'template' | 'runtime'
 
 const props = defineProps<{
   visible: boolean
   record: SandboxConfigRecord | null
   presetType?: string
-  // Which page to land on when opening an existing config, e.g. 'skills' from
-  // the card's 管理技能 entry. Ignored while creating, where order is enforced.
-  initialStep?: SandboxStepKey
-  hasInFlightSkill?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'update:visible', value: boolean): void
   (e: 'saved'): void
-  (e: 'skillsChanged', record?: SandboxConfigRecord): void
 }>()
 
 const { t } = useI18n()
+const deploymentCapabilities = useDeploymentCapabilitiesStore()
+const dockerBackendEnabled = computed(() =>
+  deploymentCapabilities.isSupported('settings.sandbox.docker'),
+)
 
 // The backend echoes stored secrets as this placeholder. It never leaves the
 // form as visible text: inputs stay empty and say "configured", and the
@@ -537,10 +817,14 @@ const isMaskedSecret = (value?: string) => value === secretPlaceholder
 // the sandbox account cannot write.
 const defaultDockerImage = 'wechatopenai/weknora-sandbox:main'
 
-const clusterGuideUrl = 'https://github.com/Tencent/WeKnora/blob/main/docs/sandbox-cluster.md'
+const clusterGuideUrl = docsUrl('sandboxDeployment')
 const e2bApiKeysUrl = 'https://e2b.dev/dashboard?tab=keys'
 
-const backendOptions = [...NAMED_SANDBOX_BACKEND_TYPES]
+const backendOptions = computed(() => {
+  const types = [...NAMED_SANDBOX_BACKEND_TYPES]
+  if (dockerBackendEnabled.value || backend.value === 'docker') return types
+  return types.filter((type) => type !== 'docker')
+})
 
 const saving = ref(false)
 const checking = ref(false)
@@ -558,6 +842,7 @@ const backend = ref('')
 // undefined rather than 0 so the input renders empty and shows its placeholder,
 // matching the HTTP timeout / TTL fields. A literal 0 would read as a real value.
 const defaultTimeoutSec = ref<number | undefined>(undefined)
+const terminalIdleDisconnectSec = ref<number | undefined>(undefined)
 const allowPrivateEndpoints = ref(false)
 const cube = reactive<SandboxCubeConfig>({})
 const e2b = reactive<SandboxE2BConfig>({})
@@ -566,6 +851,108 @@ const docker = reactive<SandboxDockerConfig>({})
 // mean "keep the saved key" instead of "no key configured".
 const storedSecrets = reactive({ cube: false, e2b: false })
 const envRows = ref<{ key: string; value: string; stored?: boolean }[]>([])
+const skillRollout = ref<'next_turn' | 'new_session'>('next_turn')
+// Both defaults are the zero value on the server too: egress allowed, inbound
+// requiring the per-sandbox credential. Inbound is not editable in this form.
+const denyEgressByDefault = ref(false)
+const allowOutRows = ref<string[]>([])
+const denyOutRows = ref<string[]>([])
+
+type CubeRuleForm = {
+  key: string
+  name: string
+  scheme?: string
+  sni?: string
+  host?: string
+  methodsText: string
+  path?: string
+  deny: boolean
+  audit?: string
+  expanded: boolean
+  inject: {
+    header: string
+    secret: string
+    format: string
+    stored?: boolean
+    originalRuleName?: string
+    originalHeader?: string
+  }[]
+}
+type E2BRuleForm = {
+  host: string
+  expanded: boolean
+  headers: {
+    name: string
+    value: string
+    stored?: boolean
+    originalHost?: string
+    originalName?: string
+  }[]
+}
+const cubeRules = ref<CubeRuleForm[]>([])
+const e2bHostRules = ref<E2BRuleForm[]>([])
+let cubeRuleKeySeq = 0
+
+function newCubeRuleKey(): string {
+  cubeRuleKeySeq += 1
+  return `cube-rule-${cubeRuleKeySeq}`
+}
+
+function isStoredNetworkSecretRecoverable(
+  row: { stored?: boolean },
+  originalParentIdentity: string | undefined,
+  originalChildIdentity: string | undefined,
+  currentParentIdentity: string,
+  currentChildIdentity: string,
+): boolean {
+  return row.stored === true
+    && originalParentIdentity === currentParentIdentity.trim()
+    && originalChildIdentity === currentChildIdentity.trim()
+}
+
+function addCubeRule() {
+  for (const rule of cubeRules.value) rule.expanded = false
+  cubeRules.value.push({
+    key: newCubeRuleKey(),
+    name: '', scheme: 'https', sni: '', host: '',
+    methodsText: '', path: '', deny: false, audit: '', expanded: true, inject: [],
+  })
+}
+
+function moveCubeRule(index: number, delta: number) {
+  const next = index + delta
+  if (next < 0 || next >= cubeRules.value.length) return
+  const [row] = cubeRules.value.splice(index, 1)
+  cubeRules.value.splice(next, 0, row)
+}
+
+function addE2BHostRule() {
+  for (const rule of e2bHostRules.value) rule.expanded = false
+  e2bHostRules.value.push({ host: '', expanded: true, headers: [] })
+}
+
+// Both providers refuse a domain allow-list without a deny-all fallback, and
+// for a good reason: destinations never resolved through the sandbox's DNS
+// stay reachable, so the list would be decorative. Warn here rather than
+// letting the save round-trip fail.
+const domainAllowNeedsDenyAll = computed(() => {
+  if (denyEgressByDefault.value) return false
+  if (denyOutRows.value.some((row) => denyOutRowCoversAllIPv4(row))) return false
+  return allowOutRows.value.some((row) => {
+    const value = row.trim()
+    if (!value) return false
+    return !/^[0-9./]+$/.test(value)
+  })
+})
+
+// Mirrors types.DenyOutCoversAllIPv4: net.ParseCIDR collapses any IPv4 /0
+// onto 0.0.0.0/0, so 1.2.3.4/0 is a real deny-all, not a false warning.
+function denyOutRowCoversAllIPv4(row: string): boolean {
+  const value = row.trim()
+  if (value === '0.0.0.0/0') return true
+  return /^\d{1,3}(?:\.\d{1,3}){3}\/0$/.test(value)
+}
+const inFlightFromSkills = ref(false)
 const templates = ref<SandboxTemplate[]>([])
 const templatesLoading = ref(false)
 const templatesLoaded = ref(false)
@@ -582,8 +969,12 @@ const currentTemplateId = computed(() => (
 )?.trim() || '')
 const selectedTemplate = computed(() => templates.value.find((item) => item.id === currentTemplateId.value))
 const clusterStandardTemplate = computed(() => templates.value.find((item) => item.standard && item.id))
+const clusterDesktopTemplate = computed(() => templates.value.find((item) => item.desktop && item.id))
 const canCreateStandard = computed(() => (
   isRemoteBackend.value && templatesLoaded.value && !clusterStandardTemplate.value && !retargetFrozen.value
+))
+const canCreateDesktop = computed(() => (
+  isRemoteBackend.value && templatesLoaded.value && !clusterDesktopTemplate.value && !retargetFrozen.value
 ))
 const wizardSteps = computed<Array<{ key: SandboxStepKey; title: string }>>(() => {
   const steps: Array<{ key: SandboxStepKey; title: string }> = [
@@ -593,7 +984,6 @@ const wizardSteps = computed<Array<{ key: SandboxStepKey; title: string }>>(() =
     steps.push({ key: 'template', title: t('settings.sandbox.stepTemplate') })
   }
   steps.push({ key: 'runtime', title: t('settings.sandbox.stepRuntime') })
-  steps.push({ key: 'skills', title: t('settings.sandbox.stepSkills') })
   return steps
 })
 const currentStepKey = computed<SandboxStepKey>(() => wizardSteps.value[wizardStep.value]?.key || 'connection')
@@ -601,53 +991,41 @@ const stepDescription = computed(() => t(`settings.sandbox.stepDescriptions.${cu
 const primaryText = computed(() => {
   if (currentStepKey.value === 'connection') return t('settings.sandbox.connectAndContinue')
   if (currentStepKey.value === 'template') return t('common.next')
-  // Nothing on the skills step is pending a save — each install, toggle and
-  // removal already went to the server on its own.
-  if (currentStepKey.value === 'skills') return t('common.finish')
-  // Runtime is the last page of settings. If skills follow, keep the wizard
-  // going after the save; otherwise this press closes the drawer.
-  if (wizardSteps.value.some((step) => step.key === 'skills')) {
-    return t('settings.sandbox.saveAndContinue')
-  }
   return t('common.save')
 })
 // Deep check needs the fields that actually get probed. Docker collects
 // the image on the connection step; Cube/E2B still have an empty template_id
 // there, so the action waits until the template step.
 const canDeepCheck = computed(() => {
+  if (backend.value === 'docker' && !dockerBackendEnabled.value) return false
   if (currentStepKey.value === 'template') return true
   return currentStepKey.value === 'connection' && !isRemoteBackend.value
 })
 const showCheckResult = computed(() => canDeepCheck.value)
 const primaryDisabled = computed(() => (
-  currentStepKey.value === 'template'
-  && (!selectedTemplate.value || !isTemplateSelectable(selectedTemplate.value))
+  (backend.value === 'docker' && !dockerBackendEnabled.value)
+  || (
+    currentStepKey.value === 'template'
+    && (!selectedTemplate.value || !isTemplateSelectable(selectedTemplate.value))
+  )
 ))
 
 // savedRecord is the config this drawer is editing, including one it just
-// created: after the first save the wizard keeps going into the skills step,
-// which needs an ID, and a second press of save must update that config rather
-// than create another one.
+// created: a second press of save must update that config rather than create
+// another one if the admin walks back through the wizard before closing.
 const savedRecord = ref<SandboxConfigRecord | null>(null)
 const effectiveRecord = computed(() => savedRecord.value || props.record)
 const hasSkillSnapshot = computed(() => (
   Boolean(effectiveRecord.value?.config?.skill_image?.snapshot_id?.trim())
 ))
-const inFlightFromPanel = ref(false)
-const hasInFlightSkill = computed(() => Boolean(props.hasInFlightSkill) || inFlightFromPanel.value)
+const hasInFlightSkill = computed(() => inFlightFromSkills.value)
 const retargetFrozen = computed(() => hasSkillSnapshot.value || hasInFlightSkill.value)
-
-function onSkillsConfigUpdated(record: SandboxConfigRecord) {
-  savedRecord.value = record
-  emit('skillsChanged', record)
-}
 
 // Jumping is what separates editing from creating. A config that does not exist
 // yet has to be built in order — its connection has to check out before there
-// are templates to choose from, and it has no image to install skills into. Once
-// it exists, every step is just a page of its settings, so all of them open
-// directly; steps already visited stay clickable during creation so the rail
-// works as a way back.
+// are templates to choose from. Once it exists, every step is just a page of
+// its settings, so all of them open directly; steps already visited stay
+// clickable during creation so the rail works as a way back.
 function canJumpTo(index: number): boolean {
   if (index === wizardStep.value) return false
   return Boolean(effectiveRecord.value) || index < wizardStep.value
@@ -683,11 +1061,19 @@ const pendingCheckNames = computed(() => (checkResult.value?.checks || [])
   .filter((item) => item.ok === null && item.reason === PENDING_SKIP_REASON)
   .map((item) => checkLabel(item.name)))
 
+const EGRESS_RESTRICTED_REASON = 'egress_restricted_by_policy'
+const egressRestrictedByPolicy = computed(() => (checkResult.value?.checks || []).some(
+  (item) => item.reason === EGRESS_RESTRICTED_REASON,
+))
+
 // Says which layer the verdict covers, so "检测通过" is not read as "everything
-// works" after a connection-only probe.
-const checkScopeHint = computed(() => (pendingCheckNames.value.length
-  ? t('settings.sandbox.checkScopeConnection')
-  : t('settings.sandbox.checkScopeFull')))
+// works" after a connection-only probe, or after egress was skipped because
+// the config denies outbound access by policy.
+const checkScopeHint = computed(() => {
+  if (pendingCheckNames.value.length) return t('settings.sandbox.checkScopeConnection')
+  if (egressRestrictedByPolicy.value) return t('settings.sandbox.checkScopePolicyRestricted')
+  return t('settings.sandbox.checkScopeFull')
+})
 
 function checkDetail(item: SandboxCheckItem): string {
   if (item.message) return item.message
@@ -765,6 +1151,7 @@ function reset() {
     ? cfg.sandbox_type!
     : defaultBackendType()
   defaultTimeoutSec.value = cfg.default_timeout_sec || undefined
+  terminalIdleDisconnectSec.value = cfg.terminal_idle_disconnect_sec || undefined
   allowPrivateEndpoints.value = cfg.allow_private_endpoints === true
   // Replace rather than merge: a reused reactive object would otherwise carry
   // the previously edited config's fields into the next one opened.
@@ -785,6 +1172,44 @@ function reset() {
   envRows.value = Object.entries(cfg.env_vars || {}).map(([key, value]) => (
     isMaskedSecret(value) ? { key, value: '', stored: true } : { key, value }
   ))
+  skillRollout.value = cfg.skill_rollout === 'new_session' ? 'new_session' : 'next_turn'
+  const net = cfg.network || {}
+  denyEgressByDefault.value = net.deny_egress_by_default === true
+  allowOutRows.value = [...(net.allow_out || [])]
+  denyOutRows.value = [...(net.deny_out || [])]
+  cubeRules.value = (net.cube_rules || []).map((rule) => ({
+    key: newCubeRuleKey(),
+    name: rule.name || '',
+    scheme: rule.scheme || '',
+    sni: rule.sni || '',
+    host: rule.host || '',
+    methodsText: (rule.methods || []).join(', '),
+    path: rule.path || '',
+    deny: rule.deny === true,
+    audit: rule.audit || '',
+    expanded: false,
+    inject: (rule.inject || []).map((inject) => ({
+      header: inject.header || '',
+      // A stored secret arrives masked; keep the input empty and say
+      // "configured", exactly like the env var rows do.
+      secret: isMaskedSecret(inject.secret) ? '' : (inject.secret || ''),
+      format: inject.format || '',
+      stored: isMaskedSecret(inject.secret),
+      originalRuleName: rule.name?.trim() || '',
+      originalHeader: inject.header?.trim() || '',
+    })),
+  }))
+  e2bHostRules.value = (net.e2b_host_rules || []).map((rule) => ({
+    host: rule.host || '',
+    expanded: false,
+    headers: Object.entries(rule.headers || {}).map(([name, value]) => ({
+      name,
+      value: isMaskedSecret(value) ? '' : value,
+      stored: isMaskedSecret(value),
+      originalHost: rule.host?.trim() || '',
+      originalName: name.trim(),
+    })),
+  }))
   checkResult.value = null
   conflict.value = null
   nameError.value = ''
@@ -793,14 +1218,7 @@ function reset() {
   templatesLoaded.value = false
   templatesError.value = ''
   savedRecord.value = null
-  inFlightFromPanel.value = false
   wizardStep.value = 0
-  // "管理技能" opens this drawer straight on the skills step. It is a jump like
-  // any other, so it only holds for a config that already exists.
-  if (props.initialStep && props.record) {
-    const index = wizardSteps.value.findIndex((step) => step.key === props.initialStep)
-    if (index >= 0) wizardStep.value = index
-  }
 }
 
 function selectBackend(value: string) {
@@ -812,12 +1230,30 @@ function selectBackend(value: string) {
   onBackendChange()
 }
 
+async function refreshInFlightSkill() {
+  const id = props.record?.id
+  if (!id) {
+    inFlightFromSkills.value = false
+    return
+  }
+  try {
+    const res = await listConfigSkills(id)
+    inFlightFromSkills.value = (res?.data || []).some(
+      (skill) => skill.status === 'installing' || skill.status === 'removing',
+    )
+  } catch {
+    inFlightFromSkills.value = false
+  }
+}
+
 watch(() => props.visible, (open) => {
   if (open) {
+    void deploymentCapabilities.ensureLoaded()
     reset()
+    void refreshInFlightSkill()
   } else {
-    inFlightFromPanel.value = false
     stopTemplatePolling()
+    inFlightFromSkills.value = false
   }
 })
 
@@ -856,10 +1292,11 @@ function onTemplateCardClick(item: SandboxTemplate) {
 }
 
 function canRebuildTemplate(item: SandboxTemplate): boolean {
-  return Boolean(item.standard && item.id) && !isTemplatePending(item) && !retargetFrozen.value
+  return Boolean((item.standard || item.desktop) && item.id) && !isTemplatePending(item) && !retargetFrozen.value
 }
 
 function templateDisplayName(item: SandboxTemplate): string {
+  if (item.standard) return t('settings.sandbox.weknoraStandardTemplate')
   const name = item.name?.trim() || ''
   const id = item.id?.trim() || ''
   if (!name || name === id) return t('settings.sandbox.templateUnnamed')
@@ -972,51 +1409,70 @@ function scheduleTemplatePolling() {
   stopTemplatePolling()
   if (!props.visible || currentStepKey.value !== 'template' || !hasPendingTemplates.value) return
   templatePollTimer = setTimeout(() => {
-    void loadTemplates(false, true)
+    void loadTemplates({ silent: true })
   }, 3000)
 }
 
-async function loadTemplates(ensureStandard = false, silent = false, replaceStandard = false): Promise<boolean> {
+async function loadTemplates(opts: {
+  ensureStandard?: boolean
+  ensureDesktop?: boolean
+  silent?: boolean
+  replaceStandard?: boolean
+  replaceDesktop?: boolean
+} = {}): Promise<boolean> {
   if (!hasImageCatalog.value) return true
   if (!connectionReady()) return false
-  if (!silent) templatesLoading.value = true
+  if (!opts.silent) templatesLoading.value = true
   templatesError.value = ''
   try {
+    // Cube/E2B: listing ensures the published CLI image when it is missing.
+    // Desktop is opt-in: XFCE images are much heavier, so they are created
+    // only when the admin clicks the desktop offer row.
+    const ensureFirstParty = isRemoteBackend.value
     const res = await querySandboxTemplates({
       config: collectPayload(),
       config_id: effectiveRecord.value?.id,
-      ensure_standard: ensureStandard,
-      replace_standard: replaceStandard,
+      ensure_standard: opts.ensureStandard || (ensureFirstParty && !opts.replaceStandard && !opts.replaceDesktop && !opts.ensureDesktop),
+      ensure_desktop: Boolean(opts.ensureDesktop),
+      replace_standard: opts.replaceStandard,
+      replace_desktop: opts.replaceDesktop,
     })
     templates.value = res.data?.templates || []
     templatesLoaded.value = true
     const standardID = res.data?.standard_template_id
+    const desktopID = res.data?.desktop_template_id
     const current = templates.value.find((item) => item.id === currentTemplateId.value)
-    if (replaceStandard && standardID) {
+    if (opts.replaceDesktop && desktopID) {
+      selectTemplate(desktopID)
+    } else if (opts.replaceStandard && standardID) {
       selectTemplate(standardID)
+    } else if (opts.ensureDesktop && desktopID) {
+      const next = templates.value.find((item) => item.id === desktopID)
+      if (next && (isTemplateSelectable(next) || isTemplatePending(next))) {
+        selectTemplate(desktopID)
+      }
+    } else if (opts.ensureStandard && standardID) {
+      const next = templates.value.find((item) => item.id === standardID)
+      if (next && (isTemplateSelectable(next) || isTemplatePending(next))) {
+        selectTemplate(standardID)
+      }
     } else if (
       currentTemplateId.value
       && (!current || (!isTemplateSelectable(current) && !isTemplatePending(current)))
       && !retargetFrozen.value
     ) {
-      if (standardID) {
-        const next = templates.value.find((item) => item.id === standardID)
-        if (next && (isTemplateSelectable(next) || isTemplatePending(next))) {
-          selectTemplate(standardID)
-        } else {
-          clearTemplateSelection()
-        }
-      } else {
-        clearTemplateSelection()
-      }
+      clearTemplateSelection()
     }
-    const readyStandard = templates.value.find((item) => item.id === standardID && isTemplateSelectable(item))
-      || templates.value.find((item) => item.standard && isTemplateSelectable(item))
-    if (!currentTemplateId.value && readyStandard) selectTemplate(readyStandard.id)
-    if (res.data?.provisioned && !silent) {
-      MessagePlugin.info(replaceStandard
-        ? t('settings.sandbox.standardTemplateReplaced')
-        : t('settings.sandbox.standardTemplateProvisioning'))
+    if (!currentTemplateId.value && !retargetFrozen.value) {
+      const firstPartyReady = templates.value.filter((item) => (
+        (item.standard || item.desktop) && isTemplateSelectable(item)
+      ))
+      if (firstPartyReady.length === 1) selectTemplate(firstPartyReady[0].id)
+    }
+    if (res.data?.provisioned && !opts.silent && (
+      opts.replaceDesktop || opts.replaceStandard || opts.ensureStandard || opts.ensureDesktop
+    )) {
+      MessagePlugin.info(provisionedTemplateMessage(opts))
     }
     scheduleTemplatePolling()
     return true
@@ -1024,17 +1480,34 @@ async function loadTemplates(ensureStandard = false, silent = false, replaceStan
     templatesError.value = e?.message || t('settings.sandbox.templateLoadFailed')
     return false
   } finally {
-    if (!silent) templatesLoading.value = false
+    if (!opts.silent) templatesLoading.value = false
   }
 }
 
-function createStandardTemplate() {
-  return loadTemplates(true)
+function provisionedTemplateMessage(opts: {
+  ensureStandard?: boolean
+  ensureDesktop?: boolean
+  replaceStandard?: boolean
+  replaceDesktop?: boolean
+}): string {
+  if (opts.replaceDesktop) return t('settings.sandbox.desktopTemplateReplaced')
+  if (opts.ensureDesktop) return t('settings.sandbox.desktopTemplateProvisioning')
+  if (opts.replaceStandard) return t('settings.sandbox.standardTemplateReplaced')
+  return t('settings.sandbox.standardTemplateProvisioning')
 }
 
-function replaceStandardTemplate() {
+function createStandardTemplate() {
+  return loadTemplates({ ensureStandard: true })
+}
+
+function createDesktopTemplate() {
+  return loadTemplates({ ensureDesktop: true })
+}
+
+function replaceFirstPartyTemplate(item: SandboxTemplate) {
   if (retargetFrozen.value) return
-  return loadTemplates(false, false, true)
+  if (item.desktop) return loadTemplates({ replaceDesktop: true })
+  return loadTemplates({ replaceStandard: true })
 }
 
 // Re-attaches the redaction placeholder to a secret the admin left untouched:
@@ -1042,6 +1515,22 @@ function replaceStandardTemplate() {
 function withStoredSecret<T extends { api_key?: string }>(block: T, stored: boolean): T {
   if (stored && !block.api_key?.trim()) block.api_key = secretPlaceholder
   return block
+}
+
+function collectedDesktopEnabled(): boolean | undefined {
+  if (selectedTemplate.value) {
+    // Persist false when the CLI card is selected; omitempty on the
+    // server would otherwise keep a stale true from a previous desktop save.
+    return Boolean(selectedTemplate.value.desktop)
+  }
+  // Skill snapshots replace template_id with a UUID that is not in the
+  // catalog. Keep the stored bit. If the catalog loaded and this ID is
+  // simply unmatched, do not keep a stale true that could disagree with
+  // template_id.
+  if (templatesLoaded.value && !retargetFrozen.value) {
+    return false
+  }
+  return effectiveRecord.value?.config?.desktop_enabled || undefined
 }
 
 function collectPayload(): SandboxConfig {
@@ -1054,9 +1543,12 @@ function collectPayload(): SandboxConfig {
   const payload: SandboxConfig = {
     sandbox_type: backend.value,
     default_timeout_sec: defaultTimeoutSec.value || undefined,
+    terminal_idle_disconnect_sec: terminalIdleDisconnectSec.value || undefined,
     allow_private_endpoints: allowPrivateEndpoints.value || undefined,
+    desktop_enabled: collectedDesktopEnabled(),
     env_vars: envVars,
-    skill_rollout: effectiveRecord.value?.config?.skill_rollout,
+    skill_rollout: skillRollout.value,
+    network: collectNetworkPolicy(),
   }
   // Send only the selected backend's block so an unused one cannot fail
   // validation (e.g. a stale private URL left in the other tab).
@@ -1064,6 +1556,82 @@ function collectPayload(): SandboxConfig {
   if (backend.value === 'e2b') payload.e2b = withStoredSecret({ ...e2b }, storedSecrets.e2b)
   if (backend.value === 'docker') payload.docker = { ...docker }
   return payload
+}
+
+// Sends the policy as its own block. Empty lists are dropped so a config the
+// admin never touched serializes to the same thing as a fresh default.
+function collectNetworkPolicy(): SandboxNetworkPolicy {
+  const policy: SandboxNetworkPolicy = {}
+  // Docker can only honour network_mode on the docker block.
+  if (backend.value === 'docker') {
+    return policy
+  }
+  if (denyEgressByDefault.value) policy.deny_egress_by_default = true
+  // Inbound stays the zero value: require the per-sandbox credential.
+
+  if (backend.value !== 'docker') {
+    const allowOut = allowOutRows.value.map((row) => row.trim()).filter(Boolean)
+    const denyOut = denyOutRows.value.map((row) => row.trim()).filter(Boolean)
+    if (allowOut.length) policy.allow_out = allowOut
+    if (denyOut.length) policy.deny_out = denyOut
+  }
+
+  if (backend.value === 'cube' && cubeRules.value.length) {
+    policy.cube_rules = cubeRules.value.map((rule) => ({
+      name: rule.name.trim(),
+      scheme: rule.scheme || undefined,
+      sni: rule.sni?.trim() || undefined,
+      host: rule.host?.trim() || undefined,
+      methods: rule.methodsText
+        .split(',')
+        .map((method) => method.trim().toUpperCase())
+        .filter(Boolean),
+      path: rule.path?.trim() || undefined,
+      deny: rule.deny || undefined,
+      audit: rule.audit || undefined,
+      inject: rule.deny
+        ? undefined
+        : rule.inject
+          .filter((inject) => inject.header.trim())
+          .map((inject) => ({
+            header: inject.header.trim(),
+            // Re-attach the placeholder only while the server-side lookup key
+            // remains the identity under which this credential was loaded.
+            secret: isStoredNetworkSecretRecoverable(
+              inject,
+              inject.originalRuleName,
+              inject.originalHeader,
+              rule.name,
+              inject.header,
+            )
+              && inject.secret === ''
+              ? secretPlaceholder
+              : inject.secret,
+            format: inject.format?.trim() || undefined,
+          })),
+    }))
+  }
+  if (backend.value === 'e2b' && e2bHostRules.value.length) {
+    policy.e2b_host_rules = e2bHostRules.value.map((rule) => {
+      const headers: Record<string, string> = {}
+      for (const header of rule.headers) {
+        const name = header.name.trim()
+        if (!name) continue
+        headers[name] = isStoredNetworkSecretRecoverable(
+          header,
+          header.originalHost,
+          header.originalName,
+          rule.host,
+          header.name,
+        )
+          && header.value === ''
+          ? secretPlaceholder
+          : header.value
+      }
+      return { host: rule.host.trim(), headers }
+    })
+  }
+  return policy
 }
 
 function close() {
@@ -1081,6 +1649,7 @@ function validateName(): boolean {
 }
 
 async function handlePrimaryAction() {
+  if (backend.value === 'docker' && !dockerBackendEnabled.value) return
   if (currentStepKey.value === 'connection') {
     if (!validateName() || !validateRequiredFields(false)) return
     if (!(await runCheck(false))) return
@@ -1093,7 +1662,7 @@ async function handlePrimaryAction() {
     // Docker's template is the image typed on this step. Kick a background
     // pull so the first session does not block on a cold registry fetch.
     if (backend.value === 'docker') {
-      void loadTemplates(true)
+      void loadTemplates({ ensureStandard: true })
     }
     invalidateCheck()
     wizardStep.value += 1
@@ -1106,10 +1675,6 @@ async function handlePrimaryAction() {
     }
     stopTemplatePolling()
     wizardStep.value += 1
-    return
-  }
-  if (currentStepKey.value === 'skills') {
-    close()
     return
   }
   await save()
@@ -1144,11 +1709,6 @@ async function save() {
     emit('saved')
     const saved = res?.data
     if (saved) savedRecord.value = saved
-    const skillsStep = wizardSteps.value.findIndex((step) => step.key === 'skills')
-    if (skillsStep >= 0 && savedRecord.value) {
-      wizardStep.value = skillsStep
-      return
-    }
     close()
   } catch (e: any) {
     const refusal = parseSandboxConflict(e)
@@ -1238,7 +1798,7 @@ onUnmounted(stopTemplatePolling)
   gap: 8px;
   min-width: 0;
   color: var(--td-text-color-placeholder);
-  transition: color 0.15s ease;
+  transition: color var(--app-motion-fast) ease;
 
   /* Only the steps that draw a connector need to absorb the leftover width. */
   &:not(:last-child) {
@@ -1273,7 +1833,7 @@ onUnmounted(stopTemplatePolling)
     &:focus-visible {
       outline: 2px solid var(--td-brand-color);
       outline-offset: 2px;
-      border-radius: 4px;
+      border-radius: var(--app-radius-xs);
     }
   }
 }
@@ -1287,7 +1847,7 @@ onUnmounted(stopTemplatePolling)
   flex-shrink: 0;
   border: 1px solid currentColor;
   border-radius: 50%;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   font-weight: 600;
   line-height: 1;
 
@@ -1306,7 +1866,7 @@ onUnmounted(stopTemplatePolling)
 
 .sandbox-step__title {
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1322,13 +1882,6 @@ onUnmounted(stopTemplatePolling)
   .is-done & {
     background: color-mix(in srgb, var(--td-brand-color) 35%, transparent);
   }
-}
-
-.skills-locked {
-  margin: 24px 0;
-  color: var(--td-text-color-placeholder);
-  font-size: 13px;
-  text-align: center;
 }
 
 .sandbox-editor-form {
@@ -1354,7 +1907,7 @@ onUnmounted(stopTemplatePolling)
 
   :deep(.t-form__label) {
     padding-bottom: 6px;
-    font-size: 13px;
+    font-size: var(--app-text-md);
     font-weight: 500;
     line-height: 1.4;
   }
@@ -1363,7 +1916,7 @@ onUnmounted(stopTemplatePolling)
   :deep(.t-input-number),
   :deep(.t-select) {
     width: 100%;
-    font-size: 13px;
+    font-size: var(--app-text-md);
   }
 }
 
@@ -1378,12 +1931,12 @@ onUnmounted(stopTemplatePolling)
   background: var(--td-bg-color-secondarycontainer);
 
   :deep(.t-alert__icon) {
-    font-size: 15px;
+    font-size: var(--app-text-lg);
   }
 
   :deep(.t-alert__message) {
     color: var(--td-text-color-secondary);
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     line-height: 1.5;
   }
 }
@@ -1395,14 +1948,14 @@ onUnmounted(stopTemplatePolling)
   gap: 16px;
   padding: 10px 12px;
   border: 1px solid var(--td-component-stroke);
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--td-bg-color-secondarycontainer);
 }
 
 .private-endpoint-row__title {
   margin: 0 0 3px;
   color: var(--td-text-color-primary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
 }
 
@@ -1432,14 +1985,14 @@ onUnmounted(stopTemplatePolling)
 
 .backend-choice__name {
   color: var(--td-text-color-primary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 500;
   line-height: 1.4;
 }
 
 .backend-choice__desc {
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.45;
   white-space: normal;
 }
@@ -1462,7 +2015,7 @@ onUnmounted(stopTemplatePolling)
   gap: 12px;
   padding: 12px;
   border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   background: var(--td-bg-color-secondarycontainer);
 
   &.is-active {
@@ -1478,7 +2031,7 @@ onUnmounted(stopTemplatePolling)
   p {
     margin: 4px 0 0;
     color: var(--td-text-color-secondary);
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     line-height: 1.5;
   }
 }
@@ -1490,7 +2043,7 @@ onUnmounted(stopTemplatePolling)
 }
 
 .weknora-template-card__title {
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
 }
 
@@ -1502,9 +2055,9 @@ onUnmounted(stopTemplatePolling)
   width: 100%;
   min-height: 88px;
   border: 1px dashed var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
 }
 
 .template-list {
@@ -1528,15 +2081,15 @@ onUnmounted(stopTemplatePolling)
   padding: 10px 12px;
   overflow: hidden;
   border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   background: var(--td-bg-color-container);
   color: var(--td-text-color-primary);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color var(--app-motion-fast) ease, box-shadow var(--app-motion-fast) ease;
 
   &:hover:not(.is-disabled):not(.template-row--offer) {
-    border-color: var(--td-brand-color-3, var(--td-brand-color));
+    border-color: var(--td-brand-color-3);
   }
 
   &.is-active {
@@ -1564,7 +2117,7 @@ onUnmounted(stopTemplatePolling)
   height: 14px;
   margin-top: 3px;
   box-sizing: border-box;
-  border: 1.5px solid var(--td-border-level-2-color, var(--td-component-stroke));
+  border: 1.5px solid var(--td-border-level-2-color);
   border-radius: 50%;
   background: var(--td-bg-color-container);
 
@@ -1603,7 +2156,7 @@ onUnmounted(stopTemplatePolling)
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
   line-height: 22px;
   text-overflow: ellipsis;
@@ -1646,7 +2199,7 @@ onUnmounted(stopTemplatePolling)
 
   dt {
     color: var(--td-text-color-placeholder);
-    font-size: 11px;
+    font-size: var(--app-text-xs);
     line-height: 18px;
     white-space: nowrap;
   }
@@ -1656,14 +2209,14 @@ onUnmounted(stopTemplatePolling)
     min-width: 0;
     overflow: hidden;
     color: var(--td-text-color-secondary);
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     line-height: 18px;
     text-overflow: ellipsis;
     white-space: nowrap;
 
     &.is-mono {
-      font-family: var(--td-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-      font-size: 11px;
+      font-family: var(--td-font-family-mono);
+      font-size: var(--app-text-xs);
     }
   }
 }
@@ -1672,7 +2225,7 @@ onUnmounted(stopTemplatePolling)
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--td-text-color-placeholder);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
 
   &--error {
@@ -1699,17 +2252,12 @@ onUnmounted(stopTemplatePolling)
   gap: 5px;
   margin-top: -4px;
   color: var(--td-brand-color);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   text-decoration: none;
 
   &:hover {
     color: var(--td-brand-color-hover);
   }
-}
-
-.runtime-fields {
-  display: flex;
-  flex-direction: column;
 }
 
 .runtime-fields :deep(.t-form__item) {
@@ -1718,15 +2266,137 @@ onUnmounted(stopTemplatePolling)
 
 .runtime-fields :deep(.t-input-number) {
   width: 100%;
-  max-width: 240px;
 }
 
-.runtime-fields .section-help--field {
-  margin-bottom: 16px;
+.net-list {
+  margin-top: 16px;
+}
 
-  &:last-child {
-    margin-bottom: 0;
-  }
+.net-list__title {
+  font-size: var(--app-text-md);
+  font-weight: 600;
+  color: var(--td-text-color-primary);
+}
+
+.net-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.net-row--double {
+  grid-template-columns: minmax(140px, 0.7fr) minmax(160px, 1.3fr) 32px;
+}
+
+.net-row--triple {
+  grid-template-columns: minmax(120px, 0.6fr) minmax(140px, 1fr) minmax(120px, 0.8fr) 32px;
+}
+
+.net-rule {
+  border: 1px solid var(--td-component-border);
+  border-radius: var(--app-radius-sm);
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.net-rule--collapsible {
+  padding: 0;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: var(--app-radius-xs);
+}
+
+.net-rule--collapsible.is-open {
+  margin-bottom: 6px;
+  border: 1px solid var(--td-component-border);
+}
+
+.net-rule__bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 2px;
+}
+
+.net-rule__actions {
+  display: flex;
+  align-items: center;
+}
+
+.net-rule__toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--td-text-color-secondary);
+  cursor: pointer;
+  border-radius: var(--app-radius-xs);
+  text-align: left;
+}
+
+.net-rule__toggle:hover {
+  background: var(--td-bg-color-container-hover);
+  color: var(--td-text-color-primary);
+}
+
+.net-rule__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--app-text-sm);
+  line-height: 18px;
+  color: var(--td-text-color-primary);
+}
+
+.net-rule__name.is-empty {
+  color: var(--td-text-color-placeholder);
+}
+
+.net-rule__move,
+.net-rule__remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+  border-radius: var(--app-radius-xs);
+}
+
+.net-rule__move:hover:not(:disabled) {
+  color: var(--td-text-color-primary);
+  background: var(--td-bg-color-container-hover);
+}
+
+.net-rule__move:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.net-rule__remove:hover {
+  color: var(--td-error-color);
+  background: var(--td-bg-color-container-hover);
+}
+
+.net-rule__body {
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--td-component-border);
+}
+
+.net-inject {
+  margin-top: 8px;
 }
 
 .env-rows {
@@ -1746,21 +2416,29 @@ onUnmounted(stopTemplatePolling)
 .env-empty {
   padding: 18px;
   border: 1px dashed var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   color: var(--td-text-color-placeholder);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   text-align: center;
+}
+
+.skill-rollout-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
 }
 
 .section-help {
   margin: 0;
   color: var(--td-text-color-placeholder);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
 
   &--under-title {
     margin-top: 5px;
-    max-width: 470px;
+    max-width: 540px;
+    white-space: pre-line;
   }
 
   /* Sits under an input inside the same form item. */
@@ -1784,7 +2462,7 @@ onUnmounted(stopTemplatePolling)
   gap: 6px;
   margin: 0;
   color: var(--td-text-color-primary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
   line-height: 1.45;
 
@@ -1801,7 +2479,7 @@ onUnmounted(stopTemplatePolling)
 .check-result__hint {
   margin: 0;
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.55;
 }
 
@@ -1820,7 +2498,7 @@ onUnmounted(stopTemplatePolling)
   gap: 8px;
   flex-wrap: wrap;
   padding: 2px 0;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
 }
 
 .check-item .ok {
@@ -1873,7 +2551,7 @@ onUnmounted(stopTemplatePolling)
   }
 
   .sandbox-step__title {
-    font-size: 12px;
+    font-size: var(--app-text-sm);
   }
 
   .template-row__fields {

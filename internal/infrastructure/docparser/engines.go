@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser/anydoc"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
@@ -29,6 +30,7 @@ const (
 )
 
 func init() {
+	types.SetPreferParserEngine(preferAnydocWhenAvailable)
 	RegisterEngine(&builtinEngine{})
 	RegisterEngine(&simpleEngine{})
 	RegisterEngine(&anydocEngine{})
@@ -37,6 +39,28 @@ func init() {
 	RegisterEngine(&mineruCloudEngine{})
 	RegisterEngine(&paddleOCRVLEngine{})
 	RegisterEngine(&paddleOCRVLCloudEngine{})
+}
+
+// preferAnydocWhenAvailable is the type-level default override: when the
+// anydoc binding is linked and converts this file type, use it instead of
+// builtin or the markitdown fallback. Simple formats stay on the Go reader.
+//
+// PDF is excluded. anydoc has no document model for it, so Convert force-
+// disables asset extraction, and AnydocReader only falls back to builtin
+// when the whole file yields no text at all. A born-digital PDF that yields
+// a few characters is therefore reported as parsed while its figures,
+// tables and layout are gone. The builtin parser classifies pages
+// individually and routes scanned ones through OCR/VLM, so it is the better
+// default for the one type anydoc cannot model.
+func preferAnydocWhenAvailable(fileType string) string {
+	ft := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(fileType), "."))
+	if IsSimpleFormat(ft) || ft == "pdf" {
+		return ""
+	}
+	if anydoc.Available() && anydoc.Supports(ft, "") {
+		return AnydocEngineName
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +75,8 @@ func (e *builtinEngine) Description() string { return "DocReader built-in parser
 
 func (e *builtinEngine) FileTypes(_ bool) []string {
 	return []string{
-		"docx", "doc", "pdf", "md", "markdown", "xlsx", "xls", "epub",
+		"docx", "doc", "pdf", "md", "markdown", "xlsx", "xls",
+		"pptx", "ppt", "epub",
 		"html", "htm", "mhtml", "xmind",
 		"jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp",
 		"mp3", "wav", "m4a", "flac", "ogg",
@@ -183,7 +208,7 @@ func (e *mineruEngine) CheckAvailable(_ bool, overrides map[string]string) (bool
 	if endpoint == "" {
 		return false, "MinerU service not configured"
 	}
-	return PingMinerU(endpoint)
+	return PingMinerU(endpoint, overrides["mineru_server_api_key"])
 }
 
 func (e *mineruEngine) NewReader(_ context.Context, deps ReaderDeps) (interfaces.DocReader, error) {

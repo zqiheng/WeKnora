@@ -27,7 +27,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -85,6 +84,10 @@ type TenantSandboxResolverDeps struct {
 	Store   SessionSandboxBindingStore
 	Checker SessionExistenceChecker
 
+	// Bootstrapper customises the first sandbox create of individual sessions
+	// (session fork). Optional: nil is the ordinary path.
+	Bootstrapper SessionBootstrapper
+
 	// SharedTransport is reused by every tenant's HTTP client. Optional; a
 	// guarded transport is installed when nil.
 	SharedTransport *http.Transport
@@ -137,11 +140,7 @@ func NewGuardedTransport() *http.Transport {
 
 func NewGuardedTransportWithPolicy(policy OutboundURLPolicy) *http.Transport {
 	return &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   SafeDialControlForPolicy(policy),
-		}).DialContext,
+		DialContext:         GuardedDialContext(policy),
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     90 * time.Second,
@@ -175,6 +174,9 @@ func (r *tenantSandboxResolver) Resolve(
 	if err != nil {
 		return nil, err
 	}
+	if err := EnsureDockerBackendAllowed(effective.Type); err != nil {
+		return nil, err
+	}
 
 	switch effective.Type {
 	case SandboxTypeDisabled:
@@ -191,6 +193,7 @@ func (r *tenantSandboxResolver) Resolve(
 			Checker:         r.deps.Checker,
 			SkipHealthProbe: true,
 			ConfigID:        configID,
+			Bootstrapper:    r.deps.Bootstrapper,
 		})
 	default:
 		return NewDisabledManager(), nil
@@ -248,6 +251,9 @@ func NewRemoteClientForCheck(cfg *Config) (RemoteSandboxClient, error) {
 		return NewE2BRemoteClientWithPool(cfg, NewSandboxGatewayTransportPoolWithPolicy(nil,
 			OutboundURLPolicy{AllowPrivate: cfg.AllowPrivateEndpoints}))
 	case SandboxTypeDocker:
+		if err := EnsureDockerBackendAllowed(SandboxTypeDocker); err != nil {
+			return nil, err
+		}
 		return NewDockerRemoteClientForCheck(cfg)
 	default:
 		return nil, fmt.Errorf("sandbox: provider %q cannot be probed", cfg.Type)

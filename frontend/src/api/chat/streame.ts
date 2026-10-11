@@ -7,8 +7,12 @@ import {
   sanitizeStreamRequestBody,
   type StreamRequestMeta,
 } from '@/utils/chatRequestDebug';
-
-
+import {
+  StreamAuthError,
+  isStreamAuthError,
+  refreshAccessTokenShared,
+  runStreamWithAuthRetry,
+} from '@/utils/authRefresh';
 
 interface StreamOptions {
   // 请求方法 (默认POST)
@@ -36,8 +40,9 @@ export function useStream() {
   let renderTimer: number | null = null
 
   // 启动流式请求
-  const startStream = async (params: { session_id: any; query: any; knowledge_base_ids?: string[]; knowledge_ids?: string[]; tag_ids?: string[]; agent_enabled?: boolean; agent_id?: string; agent_source_tenant_id?: string | number; web_search_enabled?: boolean; summary_model_id?: string; mcp_service_ids?: string[]; skill_names?: string[]; mentioned_items?: Array<{id: string; name: string; type: string; kb_type?: string; kb_id?: string; kb_name?: string; service_id?: string; skill_name?: string}>; images?: Array<{data: string}>; attachment_uploads?: Array<{data: string; file_name: string; file_size: number}>; attachment_ids?: string[]; suggestion_attribution?: { suggestion_set_id: string; question_id: string }; method: string; url: string; embed_token?: string; embed_session_sig?: string; embed_visitor_id?: string }) => {
+  const startStream = async (params: { session_id: any; query: any; knowledge_base_ids?: string[]; knowledge_ids?: string[]; tag_ids?: string[]; agent_enabled?: boolean; agent_id?: string; agent_source_tenant_id?: string | number; web_search_enabled?: boolean; local_browser_enabled?: boolean; summary_model_id?: string; reasoning_effort?: string; mcp_service_ids?: string[]; skill_names?: string[]; mentioned_items?: Array<{id: string; name: string; type: string; kb_type?: string; kb_id?: string; kb_name?: string; service_id?: string; skill_name?: string}>; images?: Array<{data: string}>; attachment_uploads?: Array<{data: string; file_name: string; file_size: number}>; attachment_ids?: string[]; suggestion_attribution?: { suggestion_set_id: string; question_id: string }; question_origin?: { knowledge_base_id: string; knowledge_id?: string }; method: string; url: string; embed_token?: string; embed_session_sig?: string; embed_visitor_id?: string }) => {
     const myGeneration = ++streamGeneration
+    const streamAbort = controller
     // 重置状态
     output.value = '';
     error.value = null;
@@ -106,9 +111,17 @@ export function useStream() {
       if (params.web_search_enabled !== undefined) {
         postBody.web_search_enabled = params.web_search_enabled;
       }
+      // Preserve the explicit browser choice when rebuilding the HTTP body.
+      if (params.local_browser_enabled !== undefined) {
+        postBody.local_browser_enabled = params.local_browser_enabled;
+      }
       // Include summary_model_id if provided (for non-Agent mode)
       if (params.summary_model_id) {
         postBody.summary_model_id = params.summary_model_id;
+      }
+      // Omit inheritance so the agent's current default remains authoritative.
+      if (params.reasoning_effort) {
+        postBody.reasoning_effort = params.reasoning_effort;
       }
       // Include mcp_service_ids if provided (for Agent mode)
       if (params.mcp_service_ids !== undefined && params.mcp_service_ids.length > 0) {
@@ -138,6 +151,9 @@ export function useStream() {
       if (params.suggestion_attribution) {
         postBody.suggestion_attribution = params.suggestion_attribution;
       }
+      if (params.question_origin) {
+        postBody.question_origin = params.question_origin;
+      }
       postBody.channel = embedToken ? "embed" : "web";
 
       lastStreamRequest.value = {
@@ -148,11 +164,14 @@ export function useStream() {
         sentAt: Date.now(),
       };
       
-      await fetchEventSource(url, {
+      // Wrapped so an expired access token can be refreshed and the request
+      // replayed once. Nothing has been streamed to the UI yet when the
+      // handshake 401s, so the replay is invisible to the user.
+      const runStream = (authToken: string) => fetchEventSource(url, {
         method: params.method,
         headers: {
           "Content-Type": "application/json",
-          "Authorization": embedToken ? `Embed ${embedToken}` : `Bearer ${token}`,
+          "Authorization": embedToken ? `Embed ${embedToken}` : `Bearer ${authToken}`,
           "Accept-Language": i18n.global.locale?.value || localStorage.getItem('locale') || 'zh-CN',
           "X-Request-ID": requestID,
           ...(!embedToken && tenantIdHeader ? { "X-Tenant-ID": tenantIdHeader } : {}),
@@ -163,10 +182,12 @@ export function useStream() {
           params.method == "POST"
             ? JSON.stringify(postBody)
             : null,
-        signal: controller.signal,
+        signal: streamAbort.signal,
         openWhenHidden: true,
 
         onopen: async (res) => {
+          // 401 is recoverable (refresh + replay); everything else is not.
+          if (res.status === 401) throw new StreamAuthError(res.status);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           console.log(`[TTFB] response:headers request_id=${requestID} elapsed_ms=${(performance.now() - sentAt).toFixed(1)}`);
           isLoading.value = false;
@@ -190,14 +211,36 @@ export function useStream() {
         },
 
         onerror: (err) => {
+          if (isStreamAuthError(err)) throw err;
           throw new Error(`${i18n.global.t('error.streamFailed')}: ${err}`);
         },
 
         onclose: () => {
-          stopStream();
+          // A queued follow-up attaches via continue-stream while the previous
+          // POST may still be open waiting for the session title. Both share one
+          // controller, so only the current stream may stop it; otherwise the
+          // old connection closing cuts the follow-up off mid-answer.
+          if (myGeneration === streamGeneration) stopStream();
         },
       });
+
+      await runStreamWithAuthRetry({
+        run: runStream,
+        initialToken: token,
+        isEmbed: Boolean(embedToken),
+        isCurrent: () => myGeneration === streamGeneration && !streamAbort.signal.aborted,
+        refreshAccessToken: () => refreshAccessTokenShared({
+          messages: {
+            pleaseRelogin: i18n.global.t('error.pleaseRelogin'),
+            tokenRefreshFailed: i18n.global.t('error.tokenRefreshFailed'),
+          },
+        }),
+        reloginMessage: i18n.global.t('error.pleaseRelogin'),
+      });
     } catch (err) {
+      // A superseded stream failing must not surface as the current error or
+      // abort the stream that replaced it (see onclose).
+      if (myGeneration !== streamGeneration) return
       error.value = err instanceof Error ? err.message : String(err)
       stopStream()
     }

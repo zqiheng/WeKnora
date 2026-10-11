@@ -75,3 +75,6 @@ docreader/.ua/*
 !docreader/.ua/.understandignore
 !docreader/.ua/config.json
 docreader/.ua/.trash-*/
+
+# Locally built BrowserSkill runtime and extension bundles
+/artifacts/browserskill/

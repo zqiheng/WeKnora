@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -38,11 +39,20 @@ type KnowledgeSpanRepository interface {
 	// running — a tree walk that stops at terminal parents would miss
 	// those orphan leaves.
 	CancelAllOpenSpans(ctx context.Context, knowledgeID string, attempt int, errorCode, reason string) (int64, error)
+	// CancelOpenSpansBeforeAttempt flips every pending/running span belonging to
+	// an attempt strictly older than `attempt` to cancelled. Reparse calls it so a
+	// superseded attempt cannot leave a "running" root behind.
+	CancelOpenSpansBeforeAttempt(
+		ctx context.Context, knowledgeID string, attempt int, errorCode, reason string,
+	) (int64, error)
 	// CancelOpenSpansByName flips pending/running rows with the given span
 	// name for (knowledgeID, attempt). Used before re-opening a subspan
 	// after asynq retry or server restart so the trace tree does not
 	// accumulate duplicate postprocess.summary / question rows.
 	CancelOpenSpansByName(ctx context.Context, knowledgeID string, attempt int, name, errorCode, reason string) (int64, error)
+	// LastActivity returns each knowledge's most recent span write, across
+	// attempts. Knowledge without spans is absent from the map.
+	LastActivity(ctx context.Context, knowledgeIDs []string) (map[string]time.Time, error)
 }
 
 type knowledgeSpanRepository struct {
@@ -61,6 +71,12 @@ func (r *knowledgeSpanRepository) Upsert(ctx context.Context, row *types.Knowled
 	if row.Attempt == 0 {
 		row.Attempt = 1
 	}
+	// Error fields may originate from third-party parser/model responses.
+	// Normalize them at the persistence boundary so SQLite/PostgreSQL and the
+	// tracing API never receive malformed UTF-8.
+	row.ErrorCode = common.CleanInvalidUTF8(row.ErrorCode)
+	row.ErrorMessage = common.CleanInvalidUTF8(row.ErrorMessage)
+	row.ErrorDetail = common.CleanInvalidUTF8(row.ErrorDetail)
 	// We let GORM populate created_at/updated_at via the autoCreate /
 	// autoUpdate tags. ON CONFLICT updates only the fields that may
 	// transition between calls — name/kind/parent are immutable once
@@ -163,6 +179,7 @@ func (r *knowledgeSpanRepository) GetSpan(ctx context.Context, knowledgeID strin
 // Postgres-specific WITH RECURSIVE would be denser but harder to test on
 // the SQLite Lite backend. The iterative path stays portable.
 func (r *knowledgeSpanRepository) CancelDescendants(ctx context.Context, knowledgeID string, attempt int, parentSpanID, reason string) (int64, error) {
+	reason = common.CleanInvalidUTF8(reason)
 	frontier := []string{parentSpanID}
 	var totalAffected int64
 	for depth := 0; depth < 16 && len(frontier) > 0; depth++ {
@@ -215,6 +232,8 @@ func (r *knowledgeSpanRepository) CancelDescendants(ctx context.Context, knowled
 func (r *knowledgeSpanRepository) CancelAllOpenSpans(
 	ctx context.Context, knowledgeID string, attempt int, errorCode, reason string,
 ) (int64, error) {
+	errorCode = common.CleanInvalidUTF8(errorCode)
+	reason = common.CleanInvalidUTF8(reason)
 	now := time.Now()
 	updates := map[string]any{
 		"status":        types.SpanStatusCancelled,
@@ -234,12 +253,41 @@ func (r *knowledgeSpanRepository) CancelAllOpenSpans(
 	return res.RowsAffected, nil
 }
 
+// CancelOpenSpansBeforeAttempt is CancelAllOpenSpans widened to every attempt
+// older than `attempt`. A reparse allocates attempt N+1 while attempt N may
+// still hold open spans (its worker died, or the row was failed without
+// finalizing); those would otherwise live forever.
+func (r *knowledgeSpanRepository) CancelOpenSpansBeforeAttempt(
+	ctx context.Context, knowledgeID string, attempt int, errorCode, reason string,
+) (int64, error) {
+	errorCode = common.CleanInvalidUTF8(errorCode)
+	reason = common.CleanInvalidUTF8(reason)
+	now := time.Now()
+	res := r.db.WithContext(ctx).Model(&types.KnowledgeProcessingSpan{}).
+		Where("knowledge_id = ? AND attempt < ? AND status IN ?",
+			knowledgeID, attempt,
+			[]string{types.SpanStatusPending, types.SpanStatusRunning}).
+		Updates(map[string]any{
+			"status":        types.SpanStatusCancelled,
+			"error_code":    errorCode,
+			"error_message": reason,
+			"finished_at":   now,
+			"updated_at":    now,
+		})
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
+}
+
 func (r *knowledgeSpanRepository) CancelOpenSpansByName(
 	ctx context.Context, knowledgeID string, attempt int, name, errorCode, reason string,
 ) (int64, error) {
 	if knowledgeID == "" || attempt <= 0 || name == "" {
 		return 0, nil
 	}
+	errorCode = common.CleanInvalidUTF8(errorCode)
+	reason = common.CleanInvalidUTF8(reason)
 	now := time.Now()
 	res := r.db.WithContext(ctx).Model(&types.KnowledgeProcessingSpan{}).
 		Where("knowledge_id = ? AND attempt = ? AND name = ? AND status IN ?",
@@ -256,4 +304,53 @@ func (r *knowledgeSpanRepository) CancelOpenSpansByName(
 		return 0, res.Error
 	}
 	return res.RowsAffected, nil
+}
+
+func (r *knowledgeSpanRepository) LastActivity(
+	ctx context.Context, knowledgeIDs []string,
+) (map[string]time.Time, error) {
+	out := make(map[string]time.Time, len(knowledgeIDs))
+	if len(knowledgeIDs) == 0 {
+		return out, nil
+	}
+	// MAX() comes back as a string on SQLite, so scan text and parse.
+	var rows []struct {
+		KnowledgeID string `gorm:"column:knowledge_id"`
+		LastSeen    string `gorm:"column:last_seen"`
+	}
+	if err := r.db.WithContext(ctx).
+		Model(&types.KnowledgeProcessingSpan{}).
+		Select("knowledge_id, MAX(updated_at) AS last_seen").
+		Where("knowledge_id IN ?", knowledgeIDs).
+		Group("knowledge_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if t, ok := ParseAggregateTime(row.LastSeen); ok {
+			out[row.KnowledgeID] = t
+		}
+	}
+	return out, nil
+}
+
+// ParseAggregateTime parses a timestamp read back through an SQL aggregate,
+// in the formats Postgres and SQLite emit.
+func ParseAggregateTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }

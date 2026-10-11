@@ -4,7 +4,10 @@ import larkIcon from '@/assets/img/datasource-lark.svg'
 import notionIcon from '@/assets/img/datasource-notion.ico'
 import yuqueIcon from '@/assets/img/datasource-yuque.ico'
 import rssIcon from '@/assets/img/datasource-rss.svg'
+import confluenceIcon from '@/assets/img/datasource-confluence.svg'
+import dingtalkIcon from '@/assets/img/im/dingtalk.svg'
 import imaIcon from '@/assets/img/datasource-ima.png'
+import seafileIcon from '@/assets/img/datasource-seafile.png'
 
 export const datasourceIconMap: Record<string, string> = {
   feishu: feishuIcon,
@@ -14,9 +17,12 @@ export const datasourceIconMap: Record<string, string> = {
   lark_drive: larkIcon,
   notion: notionIcon,
   yuque: yuqueIcon,
+  dingtalk: dingtalkIcon,
   rss: rssIcon,
+  confluence: confluenceIcon,
   gitlab: gitlabIcon,
   ima: imaIcon,
+  seafile: seafileIcon,
 }
 
 export function getDatasourceIconUrl(type: string): string | undefined {

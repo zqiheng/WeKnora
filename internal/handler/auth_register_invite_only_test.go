@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/config"
@@ -71,7 +72,7 @@ func validRegisterBody() map[string]string {
 	return map[string]string{
 		"username": "alice",
 		"email":    "alice@example.com",
-		"password": "supersecret",
+		"password": "supersecret1",
 	}
 }
 
@@ -150,6 +151,27 @@ func TestRegister_TenantlessProvisioningFromConfig(t *testing.T) {
 	}
 }
 
+func TestGetAuthConfigExposesComplexPassword(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := &AuthHandler{
+		configInfo: &config.Config{Auth: &config.AuthConfig{
+			RegistrationMode: config.AuthRegistrationModeSelfServe,
+		}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+	r := gin.New()
+	r.GET("/auth/config", h.GetAuthConfig)
+	req := httptest.NewRequest(http.MethodGet, "/auth/config", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"complex_password_enabled":true`) {
+		t.Fatalf("body=%s, want complex_password_enabled true", w.Body.String())
+	}
+}
+
 func TestRegister_NilAuthConfigDoesNotPanic(t *testing.T) {
 	// Defensive: a nil Auth section means the operator hasn't set the
 	// registration mode at all, which must not crash and must keep the
@@ -199,5 +221,70 @@ func TestRegister_PreservesPasswordBytes(t *testing.T) {
 	if gotPassword != originalPassword {
 		t.Fatalf("password mutated before UserService.Register:\n  got  %q\n  want %q",
 			gotPassword, originalPassword)
+	}
+}
+
+// Settings are resolved on every request, for the UI and both registration APIs.
+type registrationModeSettings struct {
+	interfaces.SystemSettingService
+	mode string
+}
+
+func (s *registrationModeSettings) GetString(_ context.Context, key, _, fallback string) string {
+	if key == "auth.registration_mode" {
+		return s.mode
+	}
+	return fallback
+}
+
+func (s *registrationModeSettings) GetBool(_ context.Context, _, _ string, fallback bool) bool {
+	return fallback
+}
+
+func TestRegistrationModeChangesApplyImmediately(t *testing.T) {
+	settings := &registrationModeSettings{}
+	h := &AuthHandler{
+		configInfo: &config.Config{
+			Auth: &config.AuthConfig{RegistrationMode: config.AuthRegistrationModeInviteOnly},
+		},
+		systemSettingSvc: settings,
+		userService:      &invitedRegistrationUserService{},
+		tenantService:    &invitedRegistrationTenantService{},
+		invitationSvc:    &invitedRegistrationInvitationService{},
+	}
+	r := newRegisterTestRouter(h)
+	r.POST("/auth/register-by-invite", h.RegisterByInvite)
+	r.GET("/auth/config", h.GetAuthConfig)
+	for _, mode := range []string{
+		config.AuthRegistrationModeInviteRegister,
+		config.AuthRegistrationModeSelfServe,
+		config.AuthRegistrationModeInviteOnly,
+	} {
+		settings.mode = mode
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/auth/config", nil))
+		var cfg struct {
+			RegistrationMode string `json:"registration_mode"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil || cfg.RegistrationMode != mode {
+			t.Fatalf("config must expose live mode %q: %s", mode, w.Body.String())
+		}
+		for _, path := range []string{"/auth/register", "/auth/register-by-invite"} {
+			body := validRegisterBody()
+			body["token"] = "valid-token"
+			data, _ := json.Marshal(body)
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			want := http.StatusForbidden
+			if mode == config.AuthRegistrationModeSelfServe ||
+				(mode == config.AuthRegistrationModeInviteRegister && path == "/auth/register-by-invite") {
+				want = http.StatusCreated
+			}
+			if w.Code != want {
+				t.Fatalf("mode=%s path=%s status=%d want=%d body=%s", mode, path, w.Code, want, w.Body.String())
+			}
+		}
 	}
 }

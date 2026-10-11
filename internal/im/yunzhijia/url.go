@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/Tencent/WeKnora/internal/ipclass"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 func deriveWebSocketURL(sendMsgURL, allowedHostSuffix string) (string, error) {
@@ -66,6 +69,11 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 	if err != nil {
 		return nil, fmt.Errorf("split dial address: %w", err)
 	}
+	// Whitelist-only mode refuses a non-whitelisted name before the lookup
+	// (#3378).
+	if err := utils.CheckDialWhitelistOnly(host); err != nil {
+		return nil, fmt.Errorf("endpoint host %q refused: %w", host, err)
+	}
 	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve endpoint host %q: %w", host, err)
@@ -91,7 +99,11 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 	return nil, fmt.Errorf("dial endpoint host %q: %w", host, lastErr)
 }
 
+// isPublicIP reports whether a resolved endpoint address may be dialled. The
+// webhook endpoint is tenant-supplied, so this is an SSRF check and shares
+// internal/ipclass with the other outbound guards rather than re-deriving
+// "private" from net.IP's predicates, which miss carrier-grade NAT, IPv6
+// site-local, and the encodings that embed an IPv4 link-local address.
 func isPublicIP(ip net.IP) bool {
-	return ip != nil && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() &&
-		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified() && !ip.IsMulticast()
+	return ipclass.IsPublic(ip)
 }

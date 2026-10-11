@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/application/access"
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
@@ -352,6 +355,14 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	}
 	extractor := chatpipeline.NewExtractor(chatModel, template)
 	graph, err := extractor.Extract(ctx, chunk.Content)
+	if errors.Is(err, chatpipeline.ErrModelDeclined) {
+		// The model answered in prose (e.g. declined a table-of-contents
+		// chunk). Replaying the same input cannot help, so finish the task
+		// instead of letting asynq retry it (issue #3600).
+		logger.Warnf(ctx, "graph extraction skipped for chunk %s: %v", p.ChunkID, err)
+		graphOut["skipped"] = "model_declined"
+		return nil
+	}
 	if err != nil {
 		handleErr = err
 		return err
@@ -468,15 +479,32 @@ func (s *DataTableSummaryService) Handle(ctx context.Context, t *asynq.Task) err
 
 	ctx = logger.WithRequestID(ctx, uuid.New().String())
 	ctx = logger.WithField(ctx, "knowledge", payload.KnowledgeID)
-	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
+	ctx = types.WithExecutionTenant(ctx, payload.TenantID)
 
 	logger.Infof(ctx, "Processing table extraction for knowledge: %s", payload.KnowledgeID)
 
+	knowledge, err := s.knowledgeService.GetRepository().GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
+	if errors.Is(err, repository.ErrKnowledgeNotFound) {
+		logger.Infof(ctx, "Skipping orphaned table summary task: knowledge %s not found in tenant %d",
+			payload.KnowledgeID, payload.TenantID)
+		return nil
+	}
+	if err != nil {
+		logger.Errorf(ctx, "failed to get knowledge: %v", err)
+		return err
+	}
+
 	// 2. 准备所有必需的资源（知识、模型、引擎等）
-	resources, err := s.prepareResources(ctx, payload)
+	resources, err := s.prepareResources(ctx, payload, knowledge)
 	if err != nil {
 		return err
 	}
+
+	ctx, err = access.WithKBTaskWrite(ctx, resources.knowledgeBase, payload.TenantID)
+	if err != nil {
+		return err
+	}
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, resources.tenant)
 
 	// 3. 加载表格数据并生成摘要
 	chunks, err := s.processTableData(ctx, resources)
@@ -506,11 +534,17 @@ type extractionResources struct {
 
 // prepareResources 准备提取所需的所有资源
 // 思路：集中加载所有依赖，统一错误处理，避免分散的资源获取逻辑
-func (s *DataTableSummaryService) prepareResources(ctx context.Context, payload DataTableSummaryPayload) (*extractionResources, error) {
-	// 获取并验证知识文件
-	knowledge, err := s.knowledgeService.GetKnowledgeByID(ctx, payload.KnowledgeID)
+func (s *DataTableSummaryService) prepareResources(
+	ctx context.Context,
+	payload DataTableSummaryPayload,
+	knowledge *types.Knowledge,
+) (*extractionResources, error) {
+	// 验证知识文件
+	if knowledge == nil || knowledge.ID != payload.KnowledgeID || knowledge.TenantID != payload.TenantID {
+		return nil, fmt.Errorf("invalid table summary knowledge scope")
+	}
+	kb, err := knowledgeWriteKB(ctx, s.knowledgeBaseService, knowledge)
 	if err != nil {
-		logger.Errorf(ctx, "failed to get knowledge: %v", err)
 		return nil, err
 	}
 
@@ -542,13 +576,6 @@ func (s *DataTableSummaryService) prepareResources(ctx context.Context, payload 
 		return nil, err
 	}
 
-	// Load the KB to discover its VectorStoreID binding so the factory can
-	// route to the bound store (or fall back to tenant engines if unbound).
-	kb, err := s.knowledgeBaseService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
-	if err != nil {
-		logger.Errorf(ctx, "failed to get knowledge base for vector store lookup: %v", err)
-		return nil, err
-	}
 	var vectorStoreID *string
 	if kb != nil {
 		vectorStoreID = kb.VectorStoreID
@@ -634,7 +661,7 @@ func (s *DataTableSummaryService) processTableData(ctx context.Context, resource
 	// 获取样本数据用于生成摘要
 	input := tools.DataAnalysisInput{
 		KnowledgeID: resources.knowledge.ID,
-		Sql:         fmt.Sprintf("SELECT * FROM \"%s\" LIMIT 10", tableSchema.TableName),
+		SQL:         fmt.Sprintf("SELECT * FROM \"%s\" LIMIT 10", tools.DataAnalysisTableName),
 	}
 	jsonData, err := json.Marshal(input)
 	if err != nil {
@@ -660,7 +687,9 @@ func (s *DataTableSummaryService) processTableData(ctx context.Context, resource
 		}
 		customInstructions = ResolveProcessConfig(resources.knowledgeBase, processOverrides).ChunkingConfig.TableMetadataInstructions
 	}
-	tableDescription, err := s.generateTableDescription(ctx, resources.chatModel, tableSchema.TableName,
+	// The stored summary is later shown to the model by data_schema, so it
+	// must name the model-facing table, never the physical knowledge-ID table.
+	tableDescription, err := s.generateTableDescription(ctx, resources.chatModel, tools.DataAnalysisTableName,
 		schemaDesc, sampleDesc, customInstructions)
 	if err != nil {
 		logger.Errorf(ctx, "failed to generate table description: %v", err)
@@ -668,7 +697,7 @@ func (s *DataTableSummaryService) processTableData(ctx context.Context, resource
 	}
 	logger.Debugf(ctx, "table describe of knowledge %s: %s", resources.knowledge.ID, tableDescription)
 
-	columnDescription, err := s.generateColumnDescriptions(ctx, resources.chatModel, tableSchema.TableName,
+	columnDescription, err := s.generateColumnDescriptions(ctx, resources.chatModel, tools.DataAnalysisTableName,
 		schemaDesc, sampleDesc, customInstructions)
 	if err != nil {
 		logger.Errorf(ctx, "failed to generate column descriptions: %v", err)
@@ -774,12 +803,12 @@ func (s *DataTableSummaryService) cleanupOnFailure(ctx context.Context, resource
 	logger.Warnf(ctx, "Starting cleanup due to failure: %v", indexErr)
 
 	// 1. 更新知识状态为失败
-	resources.knowledge.ParseStatus = types.ParseStatusFailed
-	resources.knowledge.ErrorMessage = indexErr.Error()
-	if err := s.knowledgeService.UpdateKnowledge(ctx, resources.knowledge); err != nil {
-		logger.Errorf(ctx, "Failed to update knowledge status: %v", err)
-	} else {
-		logger.Infof(ctx, "Updated knowledge %s status to failed", resources.knowledge.ID)
+	before, after := *resources.knowledge, *resources.knowledge
+	after.ParseStatus = types.ParseStatusFailed
+	after.ErrorMessage = indexErr.Error()
+	if err := s.knowledgeService.GetRepository().UpdateKnowledgeForTransfer(ctx, &before, &after); err != nil {
+		logger.Warnf(ctx, "Table summary cleanup skipped after knowledge changed: %v", err)
+		return
 	}
 
 	// 提取chunk IDs
@@ -790,7 +819,7 @@ func (s *DataTableSummaryService) cleanupOnFailure(ctx context.Context, resource
 
 	// 删除已创建的chunks
 	if len(chunkIDs) > 0 {
-		if err := s.chunkService.DeleteChunks(ctx, chunkIDs); err != nil {
+		if err := s.chunkService.GetRepository().DeleteChunks(ctx, resources.knowledge.TenantID, chunkIDs); err != nil {
 			logger.Errorf(ctx, "Failed to delete chunks: %v", err)
 		} else {
 			logger.Infof(ctx, "Deleted %d chunks", len(chunkIDs))
@@ -830,6 +859,9 @@ func (s *DataTableSummaryService) generateTableDescription(ctx context.Context, 
 	if err != nil {
 		return "", fmt.Errorf("failed to generate table description: %w", err)
 	}
+	if _, err := validateSummaryOutput(response); err != nil {
+		return "", fmt.Errorf("failed to generate table description: %w", err)
+	}
 
 	return fmt.Sprintf("# Table Summary\n\nTable name: %s\n\n%s", tableName, response.Content), nil
 }
@@ -853,6 +885,9 @@ func (s *DataTableSummaryService) generateColumnDescriptions(ctx context.Context
 		Thinking:    &thinking,
 	})
 	if err != nil {
+		return "", fmt.Errorf("failed to generate column descriptions: %w", err)
+	}
+	if _, err := validateSummaryOutput(response); err != nil {
 		return "", fmt.Errorf("failed to generate column descriptions: %w", err)
 	}
 

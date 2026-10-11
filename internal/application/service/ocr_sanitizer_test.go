@@ -1,6 +1,11 @@
 package service
 
-import "testing"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+)
 
 func TestSanitizeOCRText(t *testing.T) {
 	tests := []struct {
@@ -187,6 +192,46 @@ func TestLooksLikeHTML(t *testing.T) {
 	}
 }
 
+// TestSanitizeOCRText_ConvertsInlineHTMLTable guards against a regression where
+// an HTML <table> embedded in a markdown body survived sanitization untouched:
+// the mixed content does not satisfy looksLikeHTML, so the old HTML-to-markdown
+// path never ran and the raw <table> markup reached the chunker.
+func TestSanitizeOCRText_ConvertsInlineHTMLTable(t *testing.T) {
+	para := "本季度公司整体经营情况保持稳定，营收与利润两项核心指标均实现同比增长。" +
+		"为了便于管理层快速了解经营成果，下表汇总了报告期内的主要财务数据，" +
+		"供后续经营分析、预算编制以及年度考核等工作参考使用，" +
+		"请结合实际业务情况综合判断，切勿脱离业务背景单独解读其中任何一项数字。"
+	tail := "以上数据均来自财务部门审核后的正式报表，统计口径与上一报告期保持一致，" +
+		"未发生会计政策变更或追溯调整。如有疑问请与财务部门联系确认，" +
+		"最终解释权归公司财务部门所有。"
+	input := "# 报告\n\n" + para + "\n\n" +
+		`<table><tr><th>指标</th><th>数值</th></tr>` +
+		`<tr><td>营收</td><td>10亿</td></tr>` +
+		`<tr><td>利润</td><td>2.3亿</td></tr></table>` +
+		"\n\n" + tail + "\n\n"
+
+	if looksLikeHTML(input) {
+		t.Fatalf("test input unexpectedly looks like HTML; the regression test must exercise the mixed-content path")
+	}
+
+	got := sanitizeOCRText(input)
+
+	if strings.Contains(got, "<table") {
+		t.Fatalf("expected inline HTML table to be converted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "# 报告") || !strings.Contains(got, "最终解释权归公司财务部门所有。") {
+		t.Fatalf("expected surrounding markdown to be preserved, got:\n%s", got)
+	}
+	for _, want := range []string{"指标", "数值", "营收", "10亿", "利润", "2.3亿"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected converted table to retain %q, got:\n%s", want, got)
+		}
+	}
+	if !regexp.MustCompile(`\|[-:]{3,}\|`).MatchString(got) {
+		t.Fatalf("expected a GFM table separator row, got:\n%s", got)
+	}
+}
+
 func TestIsKnownEmptyReply(t *testing.T) {
 	tests := []struct {
 		input string
@@ -209,5 +254,68 @@ func TestIsKnownEmptyReply(t *testing.T) {
 				t.Errorf("isKnownEmptyReply(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateOCRTextRejectsDegenerateOutput(t *testing.T) {
+	for _, tt := range []struct {
+		name, input, reason string
+	}{
+		{"recorded empty cells", strings.Repeat("|  ", 2500), "no_readable_content"},
+		{"empty response", " \n\t", "empty_content"},
+		{"markdown skeleton", "| --- | --- |\n| | |", "no_readable_content"},
+		{"repeated phrase", strings.Repeat("传球按钮 ", 200), "repetitive_content"},
+		{"repeated suffix after real text", "传球\n" + strings.Repeat("|  ", 2500), "repetitive_content"},
+		{
+			"split delimiter loops", strings.Repeat("|  ", 1250) + "传球\n" + strings.Repeat("|  ", 1250),
+			"repetitive_content",
+		},
+		{
+			"different repeated periods", strings.Repeat("| ", 600) + "传球\n" + strings.Repeat("取消施法 ", 240),
+			"repetitive_content",
+		},
+		{"repeated wrapped lines", strings.Repeat("开始\n锁定目标\n", 100), "repetitive_content"},
+		{"empty HTML skeleton", "<html><body><div><img/></div></body></html>", "empty_content"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			text, err := validateOCRText(tt.input)
+			invalid, ok := err.(*ocrValidationError)
+			if text != "" || !ok || invalid.reason != tt.reason {
+				t.Fatalf("text=%q error=%v; want rejection %s", text, err, tt.reason)
+			}
+			if got := sanitizeOCRText(tt.input); got != "" {
+				t.Fatal("shared sanitizer must also discard rejected OCR")
+			}
+		})
+	}
+}
+
+func TestValidateOCRTextPreservesRealContent(t *testing.T) {
+	var table strings.Builder
+	table.WriteString("| 项目 | 数值 |\n| --- | --- |\n")
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&table, "| 项目%d | %d |\n", i, i)
+	}
+	for _, input := range []string{
+		"A", "3", "传球", "A\nB\nL1\nL2\n传球\n传球", "0:0\n58.29\n取消施法", "±", "$x^2 + y^2 = z^2$",
+		table.String(), strings.Repeat("同一个按钮\n", 5),
+		// A run matches many periods; its overlapping ranges must count once.
+		table.String() + strings.Repeat("X", 600),
+	} {
+		got, err := validateOCRText(input)
+		if err != nil || got != strings.TrimSpace(input) {
+			t.Fatalf("valid OCR rejected or changed: input=%q got=%q err=%v", input, got, err)
+		}
+	}
+	for _, input := range []string{
+		"No text content.", "无文字内容", "```\nNo text content.\n```",
+		"<p>No text content.</p>", "<html><body>No text content.</body></html>",
+		"<p><strong>No text content.</strong></p>",
+		"```html\n<p>No text content.</p>\n```", "<p>无文字内容</p>",
+		"<p>empty</p>", "<p>no text</p>", "<p>No text content&#46;</p>",
+	} {
+		if got, err := validateOCRText(input); err != nil || got != "" {
+			t.Fatalf("explicit no-text answer should succeed without text: %q %v", got, err)
+		}
 	}
 }

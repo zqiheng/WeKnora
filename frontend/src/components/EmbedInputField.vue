@@ -26,6 +26,7 @@
       :placeholder="t('input.placeholder')"
       :autosize="{ minRows: 2, maxRows: 6 }"
       @keydown="onKeydown"
+      @paste="onPaste"
       @compositionstart="isComposing = true"
       @compositionend="isComposing = false"
     />
@@ -201,6 +202,23 @@ const handleImageSelect = (event: Event) => {
   input.value = ''
 }
 
+const onPaste = (event: ClipboardEvent) => {
+  if (!props.showFileUploadToggle) return
+  const items = event.clipboardData?.items
+  if (!items) return
+  const imageFiles: File[] = []
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile()
+      if (file) imageFiles.push(file)
+    }
+  }
+  if (imageFiles.length > 0) {
+    event.preventDefault()
+    addImageFiles(imageFiles)
+  }
+}
+
 const addAttachmentFiles = (files: File[]) => {
   const maxSize = 20 * 1024 * 1024
   for (const file of files) {
@@ -267,14 +285,14 @@ onUnmounted(() => {
   width: 100%;
   max-width: 800px;
   margin: 0 auto;
-  background: var(--td-bg-color-container, #fff);
-  border-radius: 12px;
-  border: 0.5px solid var(--td-component-border, #e7e7e7);
+  background: var(--td-bg-color-container);
+  border-radius: var(--app-radius-xl);
+  border: 0.5px solid var(--td-component-border);
   box-shadow: 0 6px 6px rgba(0, 0, 0, 0.04), 0 12px 12px -1px rgba(0, 0, 0, 0.08);
-  transition: border-color 0.15s ease;
+  transition: border-color var(--app-motion-fast) ease;
 
   &:focus-within {
-    border-color: var(--embed-primary, var(--td-brand-color, #07c05f));
+    border-color: var(--embed-primary, var(--td-brand-color));
   }
 
   &__files {
@@ -299,7 +317,7 @@ onUnmounted(() => {
       box-shadow: none;
       background: transparent;
       padding: 14px 16px 52px;
-      font-size: 14px;
+      font-size: var(--app-text-base);
       line-height: 1.5;
       resize: none;
     }
@@ -348,9 +366,9 @@ onUnmounted(() => {
   gap: 6px;
   max-width: 220px;
   padding: 6px 10px;
-  border-radius: 8px;
-  background: var(--td-bg-color-secondarycontainer, #f3f3f3);
-  font-size: 12px;
+  border-radius: var(--app-radius-md);
+  background: var(--td-bg-color-secondarycontainer);
+  font-size: var(--app-text-sm);
 
   &__name {
     overflow: hidden;
@@ -371,9 +389,9 @@ onUnmounted(() => {
   position: relative;
   width: 56px;
   height: 56px;
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   overflow: hidden;
-  border: 1px solid var(--td-component-border, #e7e7e7);
+  border: 1px solid var(--td-component-border);
 
   img {
     width: 100%;
@@ -406,11 +424,11 @@ onUnmounted(() => {
   height: 28px;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   color: var(--td-text-color-secondary);
   background: transparent;
-  transition: color 0.15s ease, background 0.15s ease;
+  transition: color var(--app-motion-fast) ease, background var(--app-motion-fast) ease;
 
   &:hover {
     background: var(--td-bg-color-secondarycontainer);
@@ -418,7 +436,7 @@ onUnmounted(() => {
   }
 
   &.active {
-    color: var(--embed-primary, var(--td-brand-color, #07c05f));
+    color: var(--embed-primary, var(--td-brand-color));
     background: color-mix(in srgb, var(--embed-primary, #07c05f) 12%, transparent);
   }
 }
@@ -431,10 +449,10 @@ onUnmounted(() => {
   height: 28px;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
-  background: var(--embed-primary, var(--td-brand-color, #07c05f));
-  transition: background 0.15s ease, opacity 0.15s ease;
+  background: var(--embed-primary, var(--td-brand-color));
+  transition: background var(--app-motion-fast) ease, opacity var(--app-motion-fast) ease;
 
   &:hover:not(.disabled) {
     filter: brightness(0.94);
@@ -459,7 +477,7 @@ onUnmounted(() => {
   height: 28px;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   cursor: pointer;
   color: var(--td-text-color-secondary);
   background: var(--td-bg-color-secondarycontainer);

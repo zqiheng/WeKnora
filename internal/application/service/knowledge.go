@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Error definitions for knowledge service operations
@@ -199,6 +202,30 @@ func attemptSuperseded(ctx context.Context, tracker SpanTracker, knowledgeID str
 	return tracker.LatestAttempt(ctx, knowledgeID) > attempt
 }
 
+// currentAttemptSuperseded reports whether a newer attempt has started than the
+// one this pipeline step runs under (see withAttempt).
+func (s *knowledgeService) currentAttemptSuperseded(ctx context.Context, knowledgeID string) bool {
+	return attemptSuperseded(ctx, s.tracker(), knowledgeID, attemptFromCtx(ctx))
+}
+
+// summaryStatusClosedExpr moves a summary that is still pending or processing
+// to closed, and leaves a finished one alone. For writes that end a parse run:
+// the run's summary task no longer exists to settle the status itself.
+func summaryStatusClosedExpr(closed string) clause.Expr {
+	return gorm.Expr("CASE WHEN summary_status IN (?, ?) THEN ? ELSE summary_status END",
+		types.SummaryStatusPending, types.SummaryStatusProcessing, closed)
+}
+
+// isInFlightParseStatus reports whether a parse run may still own queued or
+// running tasks for a knowledge in this status.
+func isInFlightParseStatus(status string) bool {
+	switch status {
+	case types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing:
+		return true
+	}
+	return false
+}
+
 // finalizeSubtaskDetachedTimeout bounds the detached decrement so a wedged DB
 // connection can't hang a worker goroutine forever in its terminal defer.
 const finalizeSubtaskDetachedTimeout = 10 * time.Second
@@ -236,12 +263,45 @@ func finalizeSubtaskDetached(
 	if !willDrain {
 		return
 	}
+	if err := releaseSubtaskSlot(ctx, repo, knowledgeID); err != nil {
+		logger.Errorf(ctx, "finalize subtask decrement failed source=%s knowledge=%s err=%v; "+
+			"row will be left to the housekeeping sweep", source, knowledgeID, err)
+	}
+}
+
+// subtaskSlotReleaseAttempts bounds the retry of one slot release. The
+// release is the only thing that drains the slot — the task has already
+// finished — so one transient DB error must not strand the row in
+// "finalizing". The decrement and promote commit together, so a failed
+// attempt rolled back and retrying it cannot drain twice.
+const (
+	subtaskSlotReleaseAttempts = 3
+	subtaskSlotReleaseBackoff  = 200 * time.Millisecond
+)
+
+// releaseSubtaskSlot releases one finalizing slot on a context detached from
+// the caller's cancellation (see finalizeSubtaskDetached), retrying transient
+// failures within finalizeSubtaskDetachedTimeout.
+func releaseSubtaskSlot(ctx context.Context, repo interfaces.KnowledgeRepository, knowledgeID string) error {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
 	defer cancel()
-	if _, _, err := repo.FinalizeSubtask(dctx, knowledgeID); err != nil {
-		logger.Warnf(ctx, "finalize subtask decrement failed source=%s knowledge=%s err=%v",
-			source, knowledgeID, err)
+	var lastErr error
+	for attempt := 1; attempt <= subtaskSlotReleaseAttempts; attempt++ {
+		_, _, err := repo.FinalizeSubtask(dctx, knowledgeID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == subtaskSlotReleaseAttempts {
+			break
+		}
+		select {
+		case <-time.After(time.Duration(attempt) * subtaskSlotReleaseBackoff):
+		case <-dctx.Done():
+			return fmt.Errorf("%w (last error: %v)", dctx.Err(), lastErr)
+		}
 	}
+	return lastErr
 }
 
 // beginStage / endStage / failStage / skipStage are the by-name shims
@@ -396,31 +456,82 @@ func (s *knowledgeService) isKnowledgeDeleting(ctx context.Context, tenantID uin
 	return knowledge.ParseStatus == types.ParseStatusDeleting
 }
 
+// Pseudo-statuses isKnowledgeAborted reports when it could not learn the
+// row's state: the worker's context is done, or the read failed. The caller
+// must stop without cleaning up or writing its in-memory row back (a full-row
+// Save would clobber a cancel it never saw), and hand abortRetryErr to asynq.
+const (
+	abortStatusInterrupted = "interrupted"
+	abortStatusUnreadable  = "unreadable"
+)
+
+// abortRetryErr is what a pipeline step returns after bailing on status:
+// nil for a settled abort (cancelled / deleting), an error for an unknown
+// state so the task is retried instead of acked with the row in flight.
+func abortRetryErr(ctx context.Context, knowledgeID, status string) error {
+	switch status {
+	case abortStatusInterrupted:
+		return fmt.Errorf("knowledge %s: interrupted: %w", knowledgeID, context.Cause(ctx))
+	case abortStatusUnreadable:
+		return fmt.Errorf("knowledge %s: abort check could not read the row", knowledgeID)
+	}
+	return nil
+}
+
 // isKnowledgeAborted returns (true, status) when the knowledge has been
 // marked as deleting OR cancelled so async pipeline workers should bail
 // out. Status is returned so callers can branch on cleanup behavior:
 // deleting → existing cleanup of partial chunks/index applies;
 // cancelled → keep partially written data per user expectation.
 //
-// When the row is missing or unreadable we conservatively return
-// (true, ParseStatusDeleting): the existing deleting branch already
-// handles cleanup-or-no-op semantics safely.
+// Only a row that is really gone reads as deleting. A transient read error
+// must not — callers would wipe a live document's chunks and index — nor may
+// it read as "not aborted", or the caller's later full-row Save could
+// overwrite a cancel it failed to see. It reports abortStatusUnreadable.
 func (s *knowledgeService) isKnowledgeAborted(
 	ctx context.Context, tenantID uint64, knowledgeID string,
 ) (bool, string) {
 	knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to check knowledge abort status (assuming deleted): %v", err)
+	switch {
+	case err == nil && knowledge == nil, errors.Is(err, repository.ErrKnowledgeNotFound):
 		return true, types.ParseStatusDeleting
-	}
-	if knowledge == nil {
-		return true, types.ParseStatusDeleting
+	case err != nil && ctx.Err() != nil:
+		return true, abortStatusInterrupted
+	case err != nil:
+		logger.Warnf(ctx, "Failed to check knowledge abort status for %s: %v", knowledgeID, err)
+		return true, abortStatusUnreadable
 	}
 	switch knowledge.ParseStatus {
 	case types.ParseStatusDeleting, types.ParseStatusCancelled:
 		return true, knowledge.ParseStatus
 	}
 	return false, knowledge.ParseStatus
+}
+
+// isKnowledgeSourceReplaced reports whether the stored source file no longer
+// matches the in-memory knowledge this worker loaded. ReplaceKnowledgeFile
+// changes file_path under a still-running ProcessDocument; the stale worker
+// must not Save() the old path back or write chunks from the replaced file.
+func (s *knowledgeService) isKnowledgeSourceReplaced(ctx context.Context, knowledge *types.Knowledge) bool {
+	if knowledge == nil || knowledge.ID == "" || knowledge.FilePath == "" {
+		return false
+	}
+	current, err := s.repo.GetKnowledgeByID(ctx, knowledge.TenantID, knowledge.ID)
+	if err != nil || current == nil {
+		return false
+	}
+	return current.FilePath != "" && current.FilePath != knowledge.FilePath
+}
+
+// updateKnowledgeUnlessSourceReplaced persists processing state only when this
+// worker still owns the source file. A no-op skip is preferred over rolling
+// file_path back to a blob ReplaceKnowledgeFile may already have deleted.
+func (s *knowledgeService) updateKnowledgeUnlessSourceReplaced(ctx context.Context, knowledge *types.Knowledge) error {
+	if s.isKnowledgeSourceReplaced(ctx, knowledge) {
+		logger.Infof(ctx, "Skip knowledge update for %s: source file was replaced", knowledge.ID)
+		return nil
+	}
+	return s.repo.UpdateKnowledge(ctx, knowledge)
 }
 
 // checkStorageEngineConfigured verifies that the knowledge base has a storage engine configured
@@ -592,7 +703,18 @@ func (s *knowledgeService) MoveKnowledgeToFolder(ctx context.Context,
 	if err != nil {
 		return 0, err
 	}
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	rows, err := loadKnowledgeWriteBatch(ctx, s.repo, s.kbService, ids)
+	if err != nil {
+		return 0, err
+	}
+	ids = make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.KnowledgeBaseID != kbID {
+			return 0, werrors.NewForbiddenError("knowledge outside target KB")
+		}
+		ids = append(ids, row.ID)
+	}
+	tenantID := rows[0].TenantID
 	affected, err := s.repo.UpdateKnowledgeFolderPath(ctx, tenantID, kbID, ids, normalized)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to move knowledge to folder %q: %v", normalized, err)
@@ -627,7 +749,18 @@ func (s *knowledgeService) RenameKnowledgeFolder(ctx context.Context,
 		return 0, werrors.NewBadRequestError("不能将文件夹移动到它自己的子目录下")
 	}
 
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, kbID)
+	if err != nil {
+		return 0, err
+	}
+	if kb == nil || kb.ID != kbID {
+		return 0, werrors.NewNotFoundError("knowledge base not found")
+	}
+	ctx, err = requireKBWrite(ctx, kb)
+	if err != nil {
+		return 0, err
+	}
+	tenantID := kb.TenantID
 	affected, err := s.repo.RenameKnowledgeFolderPath(ctx, tenantID, kbID, source, target)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to rename folder %q to %q: %v", source, target, err)
@@ -689,7 +822,10 @@ func (s *knowledgeService) GetKnowledgeFile(ctx context.Context, id string) (io.
 }
 
 func (s *knowledgeService) UpdateKnowledge(ctx context.Context, knowledge *types.Knowledge) error {
-	record, err := s.repo.GetKnowledgeByID(ctx, ctx.Value(types.TenantIDContextKey).(uint64), knowledge.ID)
+	if knowledge == nil {
+		return werrors.NewBadRequestError("knowledge cannot be nil")
+	}
+	record, _, err := loadKnowledgeWrite(ctx, s.repo, s.kbService, knowledge.ID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get knowledge record: %v", err)
 		return err
@@ -769,48 +905,48 @@ func (s *knowledgeService) GetKnowledgeBatchWithSharedAccess(ctx context.Context
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	ownList, err := s.repo.GetKnowledgeBatch(ctx, tenantID, ids)
+	permissions := kbReadPermissions(ctx, s.kbShareService)
+	rows, err := s.repo.GetKnowledgeBatch(ctx, tenantID, ids)
 	if err != nil {
 		return nil, err
 	}
+	ownList := make([]*types.Knowledge, 0, len(rows))
 	foundSet := make(map[string]bool)
-	for _, k := range ownList {
+	appendAllowed := func(k *types.Knowledge) {
+		if k == nil || foundSet[k.ID] {
+			return
+		}
+		allowed, err := permissions.Check(k.KnowledgeBaseID, k.TenantID, types.OrgRoleViewer)
+		if err == nil && allowed {
+			ownList = append(ownList, k)
+			foundSet[k.ID] = true
+		}
+	}
+	for _, k := range rows {
+		appendAllowed(k)
 		if k != nil {
 			foundSet[k.ID] = true
 		}
 	}
-	userIDVal := ctx.Value(types.UserIDContextKey)
-	if userIDVal == nil {
-		return ownList, nil
-	}
-	userID, ok := userIDVal.(string)
-	if !ok || userID == "" {
-		return ownList, nil
-	}
-	// Plan 3: shared-KB permission is keyed on (tenant, tenant_role)
-	// rather than user. callerTenantRole drives the 3-D cap.
-	callerTenantRole := types.TenantRoleFromContext(ctx)
 	for _, id := range ids {
 		if foundSet[id] {
 			continue
 		}
 		k, err := s.repo.GetKnowledgeByIDOnly(ctx, id)
-		if err != nil || k == nil || k.KnowledgeBaseID == "" {
-			continue
+		if err != nil && !errors.Is(err, repository.ErrKnowledgeNotFound) {
+			return nil, err
 		}
-		hasPermission, err := s.kbShareService.HasTenantKBPermission(ctx, k.KnowledgeBaseID, tenantID, callerTenantRole, types.OrgRoleViewer)
-		if err != nil || !hasPermission {
-			continue
+		if err == nil {
+			appendAllowed(k)
 		}
-		foundSet[k.ID] = true
-		ownList = append(ownList, k)
+		foundSet[id] = true
 	}
 	return ownList, nil
 }
 
 // SetKnowledgeTags replaces all tags for a single knowledge entry.
 func (s *knowledgeService) SetKnowledgeTags(ctx context.Context, knowledgeID string, tagIDs []string) error {
-	return s.repo.SetKnowledgeTags(ctx, knowledgeID, tagIDs)
+	return s.UpdateKnowledgeTag(ctx, knowledgeID, tagIDs)
 }
 
 // ListKnowledgeIDsByTagIDs returns document knowledge IDs carrying any of the
@@ -909,11 +1045,11 @@ func (s *knowledgeService) GetKnowledgeTags(ctx context.Context, knowledgeIDs []
 
 // UpdateKnowledgeTag updates the tags assigned to a knowledge document.
 func (s *knowledgeService) UpdateKnowledgeTag(ctx context.Context, knowledgeID string, tagIDs []string) error {
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
+	knowledge, _, err := loadKnowledgeWrite(ctx, s.repo, s.kbService, knowledgeID)
 	if err != nil {
 		return err
 	}
+	tenantID := knowledge.TenantID
 
 	// Validate all tag IDs
 	if err := s.validateKnowledgeTagIDs(ctx, tenantID, knowledge.KnowledgeBaseID, tagIDs); err != nil {
@@ -925,29 +1061,25 @@ func (s *knowledgeService) UpdateKnowledgeTag(ctx context.Context, knowledgeID s
 
 // UpdateKnowledgeTagBatch updates tags for document knowledge items in batch.
 // authorizedKBID restricts all updates to knowledge items belonging to this KB;
-// pass empty string to skip the check (caller must ensure authorization by other means).
-func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, authorizedKBID string, updates map[string][]string) error {
+// an empty value allows multiple KBs only when every KB has an explicit write grant.
+func (s *knowledgeService) UpdateKnowledgeTagBatch(
+	ctx context.Context,
+	authorizedKBID string,
+	updates map[string][]string,
+) error {
 	if len(updates) == 0 {
 		return nil
 	}
-	tenantIDVal := ctx.Value(types.TenantIDContextKey)
-	if tenantIDVal == nil {
-		return werrors.NewUnauthorizedError("workspace ID not found in context")
-	}
-	tenantID, ok := tenantIDVal.(uint64)
-	if !ok {
-		return werrors.NewUnauthorizedError("invalid workspace ID in context")
-	}
-
-	// Get all knowledge items in batch
 	knowledgeIDs := make([]string, 0, len(updates))
-	for knowledgeID := range updates {
-		knowledgeIDs = append(knowledgeIDs, knowledgeID)
+	for id := range updates {
+		knowledgeIDs = append(knowledgeIDs, id)
 	}
-	knowledgeList, err := s.repo.GetKnowledgeBatch(ctx, tenantID, knowledgeIDs)
+	sort.Strings(knowledgeIDs)
+	knowledgeList, err := loadKnowledgeWriteBatch(ctx, s.repo, s.kbService, knowledgeIDs)
 	if err != nil {
 		return err
 	}
+	tenantID := knowledgeList[0].TenantID
 
 	// Validate all requested IDs were found and belong to the authorized KB
 	if authorizedKBID != "" {
@@ -1002,15 +1134,15 @@ func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, authoriz
 			if !ok {
 				return werrors.NewBadRequestError(fmt.Sprintf("标签 %s 不存在", tagID))
 			}
-			if tag.KnowledgeBaseID != knowledge.KnowledgeBaseID {
+			if tag.TenantID != tenantID || tag.KnowledgeBaseID != knowledge.KnowledgeBaseID {
 				return werrors.NewBadRequestError(fmt.Sprintf("标签 %s 不属于知识库 %s", tagID, knowledge.KnowledgeBaseID))
 			}
 		}
 	}
 
 	// Set tags for each knowledge
-	for knowledgeID, tagIDs := range updates {
-		if err := s.repo.SetKnowledgeTags(ctx, knowledgeID, tagIDs); err != nil {
+	for _, knowledgeID := range knowledgeIDs {
+		if err := s.repo.SetKnowledgeTags(ctx, knowledgeID, updates[knowledgeID]); err != nil {
 			return err
 		}
 	}
@@ -1021,10 +1153,12 @@ func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, authoriz
 // SearchKnowledge searches knowledge items by keyword across the tenant and shared knowledge bases.
 // fileTypes: optional list of file extensions to filter by (e.g., ["csv", "xlsx"])
 func (s *knowledgeService) SearchKnowledge(ctx context.Context, keyword string, offset, limit int, fileTypes []string) ([]*types.Knowledge, bool, int64, error) {
-	tenantID, ok := ctx.Value(types.TenantIDContextKey).(uint64)
-	if !ok {
+	caller := types.CallerFromContext(ctx)
+	tenantID := caller.TenantID
+	if tenantID == 0 {
 		return nil, false, 0, werrors.NewUnauthorizedError("Workspace ID not found in context")
 	}
+	ctx = types.WithExecutionTenant(ctx, tenantID)
 
 	scopes := make([]types.KnowledgeSearchScope, 0)
 
@@ -1041,9 +1175,9 @@ func (s *knowledgeService) SearchKnowledge(ctx context.Context, keyword string, 
 	// Shared knowledge bases (document type only). Plan 3 of #1303 keys
 	// the share lookup on (tenantID, callerTenantRole); userID is no
 	// longer load-bearing for org-share access.
-	if userIDVal := ctx.Value(types.UserIDContextKey); userIDVal != nil {
-		if userID, ok := userIDVal.(string); ok && userID != "" {
-			callerTenantRole := types.TenantRoleFromContext(ctx)
+	if s.kbShareService != nil {
+		if caller.UserID != "" {
+			callerTenantRole := caller.Role
 			sharedList, err := s.kbShareService.ListSharedKnowledgeBases(ctx, tenantID, callerTenantRole)
 			if err == nil {
 				for _, info := range sharedList {

@@ -16,16 +16,22 @@
 //
 // Self-hosted deployments complicate this, so private endpoints are an
 // explicit field on each workspace config. Even when enabled, link-local
-// ranges — including cloud metadata — stay blocked.
+// ranges — including cloud metadata — stay blocked, and that holds for the
+// IPv6 encodings that carry an IPv4 link-local address in their payload.
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/Tencent/WeKnora/internal/ipclass"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 // ErrUnsafeOutboundURL is returned for any endpoint that uses an unsupported
@@ -90,6 +96,11 @@ func (p OutboundURLPolicy) Validate(raw string) error {
 	if host == "" {
 		return fmt.Errorf("%w: missing host", ErrUnsafeOutboundURL)
 	}
+	// Whitelist-only mode refuses a host outside the whitelist before any
+	// lookup, IP literals and the loopback opt-in included (#3378).
+	if err := utils.CheckSSRFWhitelistOnly(host); err != nil {
+		return fmt.Errorf("%w: %w", ErrUnsafeOutboundURL, err)
+	}
 	// ".local" is mDNS; "localhost" is only acceptable under the opt-in.
 	lower := strings.ToLower(host)
 	if strings.HasSuffix(lower, ".local") {
@@ -122,6 +133,28 @@ func (p OutboundURLPolicy) Validate(raw string) error {
 	return nil
 }
 
+// GuardedDialContext is the DialContext every guarded transport uses: in
+// whitelist-only mode a non-whitelisted hostname is refused before the dialer
+// resolves it (#3378), and the policy's Control hook then judges the address
+// the kernel is about to connect to.
+func GuardedDialContext(policy OutboundURLPolicy) func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   SafeDialControlForPolicy(policy),
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host := addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			host = h
+		}
+		if err := utils.CheckDialWhitelistOnly(host); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrUnsafeOutboundURL, err)
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+}
+
 // DialControl refuses connections to forbidden addresses. It inspects the
 // concrete address the kernel is about to connect to, which is what makes it
 // immune to DNS rebinding.
@@ -141,36 +174,35 @@ func (p OutboundURLPolicy) DialControl(_ string, address string, _ syscall.RawCo
 }
 
 // checkIP applies the policy to a concrete address.
+//
+// The classification comes from internal/ipclass so this guard and the
+// end-user URL guard in internal/utils cannot disagree about what an address
+// is; only the verdict per class is local to the sandbox.
 func (p OutboundURLPolicy) checkIP(ip net.IP) error {
 	if ip == nil {
 		return fmt.Errorf("%w: missing address", ErrUnsafeOutboundURL)
 	}
-	// Never allowed, even under the private opt-in: link-local carries the
-	// cloud metadata service, and multicast/unspecified are meaningless here.
-	if ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() ||
-		ip.IsMulticast() {
-		return fmt.Errorf("%w: address %s is never routable to a sandbox", ErrUnsafeOutboundURL, ip)
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || isCarrierGradeNAT(ip) {
+	class, reason := ipclass.Classify(ip)
+	switch class {
+	case ipclass.Public, ipclass.Documentation:
+		// TEST-NET is never routed, so refusing it would protect nothing and
+		// would cost the tests their DNS-free stand-in for a public address.
+	case ipclass.Loopback, ipclass.Private, ipclass.CGNAT:
+		// What the opt-in exists for: Cube listens on 127.0.0.1:33000 by
+		// default, and a control plane inside RFC1918 is the normal
+		// self-hosted shape rather than an exception.
 		if !p.AllowPrivate {
 			return fmt.Errorf(
 				"%w: address %s is private; enable private endpoints for this workspace config",
 				ErrUnsafeOutboundURL, ip,
 			)
 		}
+	default:
+		// Refused even under the opt-in. LinkLocal carries the cloud metadata
+		// service; Translated is how a target reaches it while still looking
+		// like ordinary public IPv6; the rest cannot reach a sandbox at all.
+		return fmt.Errorf("%w: address %s is never routable to a sandbox (%s)",
+			ErrUnsafeOutboundURL, ip, reason)
 	}
 	return nil
-}
-
-// isCarrierGradeNAT reports whether ip falls in 100.64.0.0/10, which IsPrivate
-// does not cover but which is equally unsuitable as a public endpoint.
-func isCarrierGradeNAT(ip net.IP) bool {
-	v4 := ip.To4()
-	if v4 == nil {
-		return false
-	}
-	return v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
 }
